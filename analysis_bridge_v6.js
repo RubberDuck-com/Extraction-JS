@@ -202,8 +202,23 @@ class ScopeWalker {
     this.rel=rel; this.nm=nodeIdMap;
     this.scopes=[]; this.defs=[]; this.uses=[];
     this._evalPolluted=false;
+
+    // NEW: Enhanced semantic tracking
+    this.propWrites=[];      // obj.prop = value
+    this.propReads=[];       // x = obj.prop
+    this.destructures=[];    // {a,b} = obj mappings
+    this.closureCaptures=[]; // vars captured from outer scope
+    this.exceptions=[];      // throw/catch connections
+    this.conditionals=[];    // && || ?: tracking
   }
-  push(kind) { this.scopes.push({kind,vars:new Map(),hoisted:new Set()}); }
+  push(kind) {
+    this.scopes.push({
+      kind,
+      vars: new Map(),
+      hoisted: new Set(),
+      declaredHere: new Set()  // NEW: Track local declarations
+    });
+  }
   pop()  { this.scopes.pop(); }
   cur()  { return this.scopes[this.scopes.length-1]; }
   fn()   { for(let i=this.scopes.length-1;i>=0;i--) if(['function','arrow','module','global'].includes(this.scopes[i].kind)) return this.scopes[i]; return this.scopes[0]; }
@@ -214,9 +229,56 @@ class ScopeWalker {
     if (!scope) return;
     // fix #2: skip if already hoisted
     if (kind==='var' && scope.hoisted.has(name)) return;
+    // Track where variable was declared
+    scope.declaredHere.add(name);
+    scope.vars.set(name, {kind, depth: this.scopes.length});
     this.defs.push({varName:name,kind,depth:this.scopes.length,ref,line});
   }
-  use(name,ref,line) { if(name&&!JS_KW.has(name)) this.uses.push({varName:name,ref,line}); }
+  use(name,ref,line) {
+    if(!name||JS_KW.has(name)) return;
+    this.uses.push({varName:name,ref,line});
+    // NEW: Check for closure capture (variable from outer scope)
+    this._checkClosureCapture(name, ref, line);
+  }
+
+  // NEW: Detect closure captures - variable used in inner scope but defined in outer
+  _checkClosureCapture(name, ref, line) {
+    // Find where the variable is defined
+    let defDepth = -1;
+    for (let i = this.scopes.length - 1; i >= 0; i--) {
+      if (this.scopes[i].vars.has(name) || this.scopes[i].declaredHere.has(name)) {
+        defDepth = i + 1; // 1-indexed depth
+        break;
+      }
+    }
+    if (defDepth === -1) return; // Not found (global or built-in)
+
+    const curDepth = this.scopes.length;
+    // Check if we're in a function scope that's deeper than the definition
+    const curScopeKind = this.cur()?.kind;
+    const isInFunction = curScopeKind === 'function' || curScopeKind === 'arrow';
+
+    if (isInFunction && defDepth < curDepth) {
+      // Check if there's a function boundary between def and use
+      let crossesFunctionBoundary = false;
+      for (let i = defDepth; i < curDepth; i++) {
+        const kind = this.scopes[i]?.kind;
+        if (kind === 'function' || kind === 'arrow') {
+          crossesFunctionBoundary = true;
+          break;
+        }
+      }
+      if (crossesFunctionBoundary) {
+        this.closureCaptures.push({
+          varName: name,
+          defDepth,
+          captureDepth: curDepth,
+          ref,
+          line
+        });
+      }
+    }
+  }
 
   // fix #2: two-pass hoisting — collect all var names in fn body first, mark them
   hoistVars(body) {
@@ -311,6 +373,20 @@ class ScopeWalker {
         node.specifiers?.forEach(s=>{ if(s.local?.name) this.def(s.local.name,'const',s.local,line); });
         return;
       case 'AssignmentExpression':
+        // NEW: Track property writes for obj.prop = value
+        if (node.left?.type === 'MemberExpression' && !node.left.computed) {
+          const objName = node.left.object?.name ?? (node.left.object?.type === 'ThisExpression' ? 'this' : '<expr>');
+          const propName = node.left.property?.name;
+          if (propName) {
+            this.propWrites.push({
+              objName,
+              propName,
+              line,
+              ref: node.left,
+              valueRef: node.right
+            });
+          }
+        }
         this.flatDef(node.left,'var');
         this.walk(node.right); return;
       case 'ClassProperty': case 'ClassPrivateProperty':
@@ -337,6 +413,126 @@ class ScopeWalker {
         // fix #19: skip uses inside with scope
         if(this.scopes.some(s=>s.kind==='with')) return;
         this.use(node.name,node,line); return;
+
+      // NEW: Track property reads
+      case 'MemberExpression':
+        // Walk object first (it might have uses)
+        if(node.object) this.walk(node.object);
+        // Track non-computed property reads (obj.prop, not obj[expr])
+        if (!node.computed && node.property?.name) {
+          const objName = node.object?.name ?? (node.object?.type === 'ThisExpression' ? 'this' : '<expr>');
+          this.propReads.push({
+            objName,
+            propName: node.property.name,
+            line,
+            ref: node
+          });
+        }
+        // Walk computed property expressions
+        if (node.computed && node.property) this.walk(node.property);
+        return;
+
+      // NEW: Track short-circuit evaluation (right operand is conditional)
+      case 'LogicalExpression':
+        this.walk(node.left);
+        // Right side is conditionally evaluated based on left's truthiness
+        this.conditionals.push({
+          kind: node.operator, // '&&' or '||' or '??'
+          rightRef: node.right,
+          line,
+          conditionRef: node.left
+        });
+        this.walk(node.right);
+        return;
+
+      // NEW: Track ternary conditional branches
+      case 'ConditionalExpression':
+        this.walk(node.test);
+        // Both branches are conditional
+        this.conditionals.push({
+          kind: 'ternary_true',
+          rightRef: node.consequent,
+          line,
+          conditionRef: node.test
+        });
+        this.conditionals.push({
+          kind: 'ternary_false',
+          rightRef: node.alternate,
+          line,
+          conditionRef: node.test
+        });
+        this.walk(node.consequent);
+        this.walk(node.alternate);
+        return;
+
+      // NEW: Track exception throws
+      case 'ThrowStatement':
+        this.exceptions.push({
+          kind: 'throw',
+          ref: node,
+          argRef: node.argument,
+          line
+        });
+        if(node.argument) this.walk(node.argument);
+        return;
+
+      // NEW: Track try/catch exception flow
+      case 'TryStatement':
+        // Track the catch parameter as receiving the thrown exception
+        if (node.handler?.param) {
+          this.exceptions.push({
+            kind: 'catch',
+            ref: node.handler,
+            paramRef: node.handler.param,
+            line: node.handler.loc?.start?.line ?? -1
+          });
+        }
+        // Walk children in normal manner
+        if(node.block) this.walk(node.block);
+        if(node.handler) this.walk(node.handler);
+        if(node.finalizer) this.walk(node.finalizer);
+        return;
+
+      // NEW: Track destructuring assignments
+      case 'VariableDeclarator':
+        // Handle destructuring: const {a, b} = obj
+        if (node.id?.type === 'ObjectPattern' && node.init) {
+          const sourceName = node.init.name ?? (node.init.type === 'MemberExpression' ?
+            `${node.init.object?.name ?? '<expr>'}.${node.init.property?.name ?? '?'}` : '<expr>');
+          for (const prop of node.id.properties ?? []) {
+            if (prop.type === 'RestElement') continue;
+            const targetName = prop.value?.name ?? prop.key?.name;
+            const sourceProp = prop.key?.name;
+            if (targetName && sourceProp) {
+              this.destructures.push({
+                targetName,
+                sourceProp,
+                sourceName,
+                line,
+                ref: prop
+              });
+            }
+          }
+        }
+        // Handle array destructuring: const [a, b] = arr
+        if (node.id?.type === 'ArrayPattern' && node.init) {
+          const sourceName = node.init.name ?? '<expr>';
+          node.id.elements?.forEach((el, idx) => {
+            if (el?.type === 'Identifier') {
+              this.destructures.push({
+                targetName: el.name,
+                sourceProp: `[${idx}]`,
+                sourceName,
+                line,
+                ref: el
+              });
+            }
+          });
+        }
+        // Continue with normal handling
+        if(node.init) this.walk(node.init);
+        return;
+
       default:
         for(const k of Object.keys(node)){
           if(['type','loc','start','end','tokens','comments'].includes(k)) continue;
@@ -464,6 +660,236 @@ class ScopeWalker {
       defsByLine.get(d.line).push(d);
     }
 
+    // ====== NEW: PROPERTY_WRITE nodes ======
+    const propWriteNodes = new Map(); // `${objName}.${propName}:${line}` -> nodeId
+    for(const pw of this.propWrites) {
+      const id = nid();
+      const astId = this.nm.get(pw.ref) ?? -1;
+      nodes.push({
+        id,
+        label: `${pw.objName}.${pw.propName}`,
+        type: 'PROPERTY_WRITE',
+        full_label: `${pw.objName}.${pw.propName} = ...`,
+        object_name: pw.objName,
+        property_name: pw.propName,
+        line: pw.line,
+        end_line: pw.line,
+        file: this.rel,
+        full_path: this.rel,
+        ast_ref: astId
+      });
+      propWriteNodes.set(`${pw.objName}.${pw.propName}:${pw.line}`, id);
+    }
+
+    // ====== NEW: PROPERTY_READ nodes ======
+    const propReadNodes = new Map(); // `${objName}.${propName}:${line}` -> nodeId
+    for(const pr of this.propReads) {
+      const id = nid();
+      const astId = this.nm.get(pr.ref) ?? -1;
+      nodes.push({
+        id,
+        label: `${pr.objName}.${pr.propName}`,
+        type: 'PROPERTY_READ',
+        full_label: `read ${pr.objName}.${pr.propName}`,
+        object_name: pr.objName,
+        property_name: pr.propName,
+        line: pr.line,
+        end_line: pr.line,
+        file: this.rel,
+        full_path: this.rel,
+        ast_ref: astId
+      });
+      propReadNodes.set(`${pr.objName}.${pr.propName}:${pr.line}`, id);
+    }
+
+    // Build PROPERTY_FLOW edges (property write -> property read)
+    const propWritesByKey = new Map();
+    for(const pw of this.propWrites) {
+      const key = `${pw.objName}.${pw.propName}`;
+      if(!propWritesByKey.has(key)) propWritesByKey.set(key, []);
+      propWritesByKey.get(key).push(pw);
+    }
+    for(const arr of propWritesByKey.values()) arr.sort((a,b) => a.line - b.line);
+
+    for(const pr of this.propReads) {
+      const key = `${pr.objName}.${pr.propName}`;
+      const writes = (propWritesByKey.get(key) ?? []).filter(pw => pw.line <= pr.line);
+      if(!writes.length) continue;
+      const best = writes[writes.length - 1];
+      const writeNodeId = propWriteNodes.get(`${best.objName}.${best.propName}:${best.line}`);
+      const readNodeId = propReadNodes.get(`${pr.objName}.${pr.propName}:${pr.line}`);
+      if(writeNodeId != null && readNodeId != null && writeNodeId !== readNodeId) {
+        edges.push({
+          src: writeNodeId,
+          dst: readNodeId,
+          edge_type: 'PROPERTY_FLOW',
+          object_name: pr.objName,
+          property_name: pr.propName,
+          def_line: best.line,
+          use_line: pr.line
+        });
+      }
+    }
+
+    // ====== NEW: CLOSURE_CAPTURE nodes and edges ======
+    for(const cc of this.closureCaptures) {
+      const id = nid();
+      const astId = this.nm.get(cc.ref) ?? -1;
+      nodes.push({
+        id,
+        label: cc.varName,
+        type: 'CLOSURE_CAPTURE',
+        full_label: `capture ${cc.varName}`,
+        var_name: cc.varName,
+        captured_from_depth: cc.defDepth,
+        captured_to_depth: cc.captureDepth,
+        line: cc.line,
+        end_line: cc.line,
+        file: this.rel,
+        full_path: this.rel,
+        ast_ref: astId
+      });
+
+      // Find the definition node for this captured variable
+      const defs = byName.get(cc.varName) ?? [];
+      const reachingDefs = defs.filter(d => d.line <= cc.line);
+      if(reachingDefs.length > 0) {
+        const best = reachingDefs[reachingDefs.length - 1];
+        const defNode = defNodes.get(`${best.varName}:${best.line}`);
+        if(defNode) {
+          edges.push({
+            src: defNode.id,
+            dst: id,
+            edge_type: 'CLOSURE_CAPTURE',
+            var_name: cc.varName,
+            captured_from_depth: cc.defDepth,
+            captured_to_depth: cc.captureDepth
+          });
+        }
+      }
+    }
+
+    // ====== NEW: EXCEPTION nodes and edges ======
+    const throwNodes = [];
+    const catchNodes = [];
+    for(const ex of this.exceptions) {
+      const id = nid();
+      const astId = this.nm.get(ex.ref) ?? -1;
+      if(ex.kind === 'throw') {
+        nodes.push({
+          id,
+          label: 'throw',
+          type: 'EXCEPTION_THROW',
+          full_label: 'throw exception',
+          line: ex.line,
+          end_line: ex.line,
+          file: this.rel,
+          full_path: this.rel,
+          ast_ref: astId
+        });
+        throwNodes.push({id, line: ex.line});
+      } else { // catch
+        const paramName = ex.paramRef?.name ?? ex.paramRef?.left?.name ?? '<err>';
+        nodes.push({
+          id,
+          label: `catch(${paramName})`,
+          type: 'EXCEPTION_CATCH',
+          full_label: `catch(${paramName})`,
+          param_name: paramName,
+          line: ex.line,
+          end_line: ex.line,
+          file: this.rel,
+          full_path: this.rel,
+          ast_ref: astId
+        });
+        catchNodes.push({id, line: ex.line, paramName});
+      }
+    }
+
+    // Link throws to catches (simple: throws before catch in same scope)
+    // This is a simplification; real exception flow is more complex
+    for(const t of throwNodes) {
+      for(const c of catchNodes) {
+        if(c.line > t.line) {
+          edges.push({
+            src: t.id,
+            dst: c.id,
+            edge_type: 'EXCEPTION_FLOW',
+            throw_line: t.line,
+            catch_line: c.line
+          });
+          break; // Link to nearest catch only
+        }
+      }
+    }
+
+    // ====== NEW: CONDITIONAL_VALUE nodes for short-circuit/ternary ======
+    for(const cond of this.conditionals) {
+      const id = nid();
+      const astId = this.nm.get(cond.rightRef) ?? -1;
+      const kindLabel = cond.kind === 'ternary_true' ? '?:T' :
+                       cond.kind === 'ternary_false' ? '?:F' :
+                       cond.kind;
+      nodes.push({
+        id,
+        label: kindLabel,
+        type: 'CONDITIONAL_VALUE',
+        full_label: `conditional(${cond.kind})`,
+        operator: cond.kind,
+        line: cond.line,
+        end_line: cond.line,
+        file: this.rel,
+        full_path: this.rel,
+        ast_ref: astId
+      });
+
+      // Create CONDITIONAL_USE edges from condition to conditional value
+      const condAstId = this.nm.get(cond.conditionRef);
+      if(condAstId != null) {
+        edges.push({
+          src: condAstId,
+          dst: id,
+          edge_type: 'CONDITIONAL_USE',
+          operator: cond.kind,
+          condition_line: cond.line
+        });
+      }
+    }
+
+    // ====== NEW: DESTRUCTURE nodes and edges ======
+    for(const d of this.destructures) {
+      const id = nid();
+      const astId = this.nm.get(d.ref) ?? -1;
+      nodes.push({
+        id,
+        label: d.targetName,
+        type: 'DESTRUCTURE_TARGET',
+        full_label: `${d.targetName} <- ${d.sourceName}.${d.sourceProp}`,
+        target_name: d.targetName,
+        source_name: d.sourceName,
+        source_prop: d.sourceProp,
+        line: d.line,
+        end_line: d.line,
+        file: this.rel,
+        full_path: this.rel,
+        ast_ref: astId
+      });
+
+      // Link to the corresponding property read if exists
+      const propReadKey = `${d.sourceName}.${d.sourceProp}:${d.line}`;
+      const propReadId = propReadNodes.get(propReadKey);
+      if(propReadId != null) {
+        edges.push({
+          src: propReadId,
+          dst: id,
+          edge_type: 'DESTRUCTURE_FLOW',
+          target_name: d.targetName,
+          source_name: d.sourceName,
+          source_prop: d.sourceProp
+        });
+      }
+    }
+
     return {nodes, edges};
   }
 
@@ -514,7 +940,11 @@ function extractDefsUses(node) {
 // Synthetic CFG node types that should always get unique IDs (not reuse AST IDs)
 const SYNTHETIC_CFG_TYPES = new Set([
   'ENTRY', 'EXIT', 'JOIN', 'LABEL_JOIN', 'SWITCH_JOIN', 'OPT_JOIN',
-  'TRY', 'CATCH', 'FINALLY'
+  'TRY', 'CATCH', 'FINALLY',
+  // NEW: Logical and ternary synthetic nodes
+  'LOGICAL_JOIN', 'TERNARY_JOIN',
+  'LogicalLeft', 'LogicalRight',
+  'TernaryTest', 'TernaryTrue', 'TernaryFalse'
 ]);
 
 // Helper to generate descriptive labels from AST nodes
@@ -731,6 +1161,41 @@ class CFGBuilder {
         return{node:oc,next:[oj]};
       }
       case 'BlockStatement':{const r=this._block(s.body,[],ctx);return r.firstNode?{node:r.firstNode,next:r.exits}:null;}
+
+      // NEW: LogicalExpression - short-circuit evaluation
+      case 'LogicalExpression': {
+        const left = this._n(`${s.operator}L:${s.loc?.start?.line}`, 'LogicalLeft', s.left, {operator: s.operator});
+        const right = this._n(`${s.operator}R:${s.loc?.start?.line}`, 'LogicalRight', s.right, {operator: s.operator});
+        const join = this._n(`${s.operator}J:${s.loc?.end?.line}`, 'LOGICAL_JOIN', s, {operator: s.operator});
+
+        // For &&: right evaluated only if left is truthy; short-circuit to join if left is falsy
+        // For ||: right evaluated only if left is falsy; short-circuit to join if left is truthy
+        // For ??: right evaluated only if left is nullish; short-circuit to join if left is non-nullish
+        const evalCond = s.operator === '&&' ? 'truthy' : (s.operator === '||' ? 'falsy' : 'nullish');
+        const skipCond = s.operator === '&&' ? 'falsy' : (s.operator === '||' ? 'truthy' : 'not_nullish');
+
+        this._e(left, right, 'CFG', {condition: evalCond});
+        this._e(left, join, 'CFG', {condition: skipCond, short_circuit: true});
+        this._e(right, join, 'CFG');
+
+        return {node: left, next: [join]};
+      }
+
+      // NEW: ConditionalExpression - ternary operator
+      case 'ConditionalExpression': {
+        const test = this._n(`TERN:${s.loc?.start?.line}`, 'TernaryTest', s.test);
+        const conseq = this._n(`TERN_T:${s.loc?.start?.line}`, 'TernaryTrue', s.consequent);
+        const alt = this._n(`TERN_F:${s.loc?.start?.line}`, 'TernaryFalse', s.alternate);
+        const join = this._n(`TERN_J:${s.loc?.end?.line}`, 'TERNARY_JOIN', s);
+
+        this._e(test, conseq, 'CFG', {condition: 'true', ternary_branch: 'consequent'});
+        this._e(test, alt, 'CFG', {condition: 'false', ternary_branch: 'alternate'});
+        this._e(conseq, join, 'CFG');
+        this._e(alt, join, 'CFG');
+
+        return {node: test, next: [join]};
+      }
+
       default:{const n=this._n(`${s.type}:${s.loc?.start?.line}`,s.type,s);return{node:n,next:[n]};}
     }
   }
@@ -1153,12 +1618,46 @@ function computePDG(cfgNodes, cfgEdges, ddgEdges) {
     const A=e.src,B=e.dst;
     if(!nm.has(A)||!nm.has(B))continue;
     if(isBackEdge(A,B))continue; // fix #4: skip back edges
+
+    // Determine the edge type based on CFG edge properties
+    let edgeType = 'PDG_CONTROL';
+    const srcNode = nm.get(A);
+
+    // NEW: Recognize short-circuit conditional edges
+    if(e.short_circuit === true) {
+      edgeType = 'PDG_CONDITIONAL';
+    }
+    // NEW: Recognize ternary branch edges
+    else if(e.ternary_branch === 'consequent') {
+      edgeType = 'PDG_TERNARY_TRUE';
+    }
+    else if(e.ternary_branch === 'alternate') {
+      edgeType = 'PDG_TERNARY_FALSE';
+    }
+    // NEW: Recognize logical operator dependencies
+    else if(srcNode?.type === 'LogicalLeft' || srcNode?.type === 'LogicalRight') {
+      edgeType = 'PDG_CONDITIONAL';
+    }
+    else if(srcNode?.type === 'TernaryTest') {
+      edgeType = e.condition === 'true' ? 'PDG_TERNARY_TRUE' : 'PDG_TERNARY_FALSE';
+    }
+
     const ipdA=idom.get(A);
     const visited=new Set();let cur=B;
     while(cur!=null&&cur!==ipdA&&cur!==VEXIT&&!visited.has(cur)){
       visited.add(cur);
-      if(cur!==A&&nm.has(cur))
-        cdEdges.push({src:A,dst:cur,edge_type:'PDG_CONTROL',condition:e.condition??e.edge_label??'branch',source_line:nm.get(A)?.line??-1,target_line:nm.get(cur)?.line??-1});
+      if(cur!==A&&nm.has(cur)) {
+        cdEdges.push({
+          src:A,
+          dst:cur,
+          edge_type: edgeType,
+          condition: e.condition ?? e.edge_label ?? 'branch',
+          short_circuit: e.short_circuit ?? false,
+          ternary_branch: e.ternary_branch ?? null,
+          source_line: nm.get(A)?.line ?? -1,
+          target_line: nm.get(cur)?.line ?? -1
+        });
+      }
       cur=idom.get(cur);
     }
   }
