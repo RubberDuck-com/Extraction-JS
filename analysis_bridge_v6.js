@@ -357,8 +357,118 @@ class ScopeWalker {
     if(find(body)) this._evalPolluted=true;
   }
 
-  buildDDGEdges() {
+  // Build DDG with dedicated nodes (like Python extractor)
+  buildDDG() {
     // fix #20: skip entirely if eval-polluted
+    if(this._evalPolluted) return {nodes:[], edges:[]};
+
+    const nodes = [];
+    const edges = [];
+    const defNodes = new Map();  // varName:line -> node id
+    const useNodes = new Map();  // varName:line -> node id
+
+    // Create ASSIGN_TARGET nodes for definitions
+    for(const d of this.defs) {
+      const id = nid();
+      const astId = this.nm.get(d.ref) ?? -1;
+      nodes.push({
+        id,
+        label: d.varName,
+        type: 'ASSIGN_TARGET',
+        full_label: `${d.kind} ${d.varName}`,
+        var_name: d.varName,
+        var_kind: d.kind,
+        line: d.line,
+        end_line: d.line,
+        file: this.rel,
+        full_path: this.rel,
+        ast_ref: astId,
+        scope_depth: d.depth
+      });
+      defNodes.set(`${d.varName}:${d.line}`, {id, def: d});
+    }
+
+    // Create VAR_USE nodes for uses
+    for(const u of this.uses) {
+      const id = nid();
+      const astId = this.nm.get(u.ref) ?? -1;
+      nodes.push({
+        id,
+        label: u.varName,
+        type: 'VAR_USE',
+        full_label: `use ${u.varName}`,
+        var_name: u.varName,
+        line: u.line,
+        end_line: u.line,
+        file: this.rel,
+        full_path: this.rel,
+        ast_ref: astId
+      });
+      useNodes.set(`${u.varName}:${u.line}`, {id, use: u});
+    }
+
+    // Build def-use edges
+    const byName = new Map();
+    for(const d of this.defs) {
+      if(!byName.has(d.varName)) byName.set(d.varName, []);
+      byName.get(d.varName).push(d);
+    }
+    for(const a of byName.values()) a.sort((a,b) => a.line - b.line);
+
+    for(const u of this.uses) {
+      const useKey = `${u.varName}:${u.line}`;
+      const useNode = useNodes.get(useKey);
+      if(!useNode) continue;
+
+      const ds = (byName.get(u.varName) ?? []).filter(d => d.line <= u.line);
+      if(!ds.length) continue;
+
+      // Most recent definition
+      const best = ds[ds.length - 1];
+      const defKey = `${best.varName}:${best.line}`;
+      const defNode = defNodes.get(defKey);
+      if(defNode && defNode.id !== useNode.id) {
+        edges.push({
+          src: defNode.id,
+          dst: useNode.id,
+          edge_type: 'USE',
+          var_name: u.varName,
+          def_line: best.line,
+          use_line: u.line
+        });
+      }
+
+      // Alternative definitions (for phi nodes / multiple paths)
+      if(ds.length > 1) {
+        const prev = ds[ds.length - 2];
+        const prevKey = `${prev.varName}:${prev.line}`;
+        const prevNode = defNodes.get(prevKey);
+        if(prevNode && prevNode.id !== useNode.id && prev.line !== best.line) {
+          edges.push({
+            src: prevNode.id,
+            dst: useNode.id,
+            edge_type: 'USE_ALT',
+            var_name: u.varName,
+            def_line: prev.line,
+            use_line: u.line
+          });
+        }
+      }
+    }
+
+    // Add ASSIGN edges (from value to target within same statement)
+    // Group defs by line to find assignments
+    const defsByLine = new Map();
+    for(const d of this.defs) {
+      if(!defsByLine.has(d.line)) defsByLine.set(d.line, []);
+      defsByLine.get(d.line).push(d);
+    }
+
+    return {nodes, edges};
+  }
+
+  // Legacy method for backward compatibility - returns just edges using AST node IDs
+  buildDDGEdges() {
     if(this._evalPolluted) return [];
     const byName=new Map();
     for(const d of this.defs){if(!byName.has(d.varName))byName.set(d.varName,[]);byName.get(d.varName).push(d);}
@@ -401,13 +511,113 @@ function extractDefsUses(node) {
   return{defs:[...defs],uses:[...uses]};
 }
 
+// Synthetic CFG node types that should always get unique IDs (not reuse AST IDs)
+const SYNTHETIC_CFG_TYPES = new Set([
+  'ENTRY', 'EXIT', 'JOIN', 'LABEL_JOIN', 'SWITCH_JOIN', 'OPT_JOIN',
+  'TRY', 'CATCH', 'FINALLY'
+]);
+
+// Helper to generate descriptive labels from AST nodes
+function getNodeLabel(node, maxLen = 60) {
+  if (!node) return '<unknown>';
+
+  switch(node.type) {
+    case 'VariableDeclaration': {
+      const kind = node.kind;
+      const names = (node.declarations || []).map(d => {
+        if (d.id?.name) return d.id.name;
+        if (d.id?.type === 'ObjectPattern') return '{...}';
+        if (d.id?.type === 'ArrayPattern') return '[...]';
+        return '?';
+      }).join(', ');
+      const init = node.declarations?.[0]?.init;
+      let val = '';
+      if (init?.type === 'CallExpression') {
+        val = ` = ${init.callee?.name || init.callee?.property?.name || 'fn'}(...)`;
+      } else if (init?.type === 'NewExpression') {
+        val = ` = new ${init.callee?.name || '?'}(...)`;
+      } else if (init?.type === 'Literal' || init?.type === 'StringLiteral' || init?.type === 'NumericLiteral') {
+        val = ` = ${JSON.stringify(init.value).slice(0, 20)}`;
+      } else if (init?.type === 'Identifier') {
+        val = ` = ${init.name}`;
+      }
+      return `${kind} ${names}${val}`.slice(0, maxLen);
+    }
+    case 'ExpressionStatement': {
+      const expr = node.expression;
+      if (expr?.type === 'AssignmentExpression') {
+        const left = expr.left?.name || expr.left?.property?.name || '?';
+        return `${left} ${expr.operator} ...`.slice(0, maxLen);
+      }
+      if (expr?.type === 'CallExpression') {
+        const callee = expr.callee?.name || expr.callee?.property?.name || 'fn';
+        return `${callee}(...)`.slice(0, maxLen);
+      }
+      if (expr?.type === 'AwaitExpression') {
+        return `await ...`.slice(0, maxLen);
+      }
+      return `expr:${expr?.type || '?'}`.slice(0, maxLen);
+    }
+    case 'ReturnStatement': {
+      if (!node.argument) return 'return';
+      if (node.argument.type === 'Identifier') return `return ${node.argument.name}`;
+      if (node.argument.type === 'Literal') return `return ${JSON.stringify(node.argument.value).slice(0, 20)}`;
+      return `return <${node.argument.type}>`.slice(0, maxLen);
+    }
+    case 'IfStatement': {
+      const test = node.test;
+      if (test?.type === 'Identifier') return `if (${test.name})`;
+      if (test?.type === 'BinaryExpression') {
+        const left = test.left?.name || '?';
+        const right = test.right?.name || test.right?.value || '?';
+        return `if (${left} ${test.operator} ${right})`.slice(0, maxLen);
+      }
+      return 'if (...)';
+    }
+    case 'ForStatement': return 'for (...)';
+    case 'ForInStatement': return `for (${node.left?.declarations?.[0]?.id?.name || '?'} in ...)`;
+    case 'ForOfStatement': return `for (${node.left?.declarations?.[0]?.id?.name || '?'} of ...)`;
+    case 'WhileStatement': return 'while (...)';
+    case 'DoWhileStatement': return 'do...while (...)';
+    case 'SwitchStatement': return `switch (${node.discriminant?.name || '...'})`;
+    case 'ThrowStatement': return 'throw ...';
+    case 'TryStatement': return 'try {...}';
+    case 'ImportDeclaration': {
+      const source = node.source?.value || '?';
+      return `import ... from '${source}'`.slice(0, maxLen);
+    }
+    default:
+      return node.type;
+  }
+}
+
 class CFGBuilder {
   constructor(rel,nm){this.rel=rel;this.nm=nm;this.nodes=[];this.edges=[];}
-  _n(label,type,an){
-    const id=an?(this.nm.get(an)??nid()):nid();
+  _n(label,type,an,extraAttrs={}){
+    // Fix: Synthetic nodes (ENTRY, EXIT, JOIN, etc.) always get unique IDs
+    // This ensures CFG has its own nodes separate from AST
+    const isSynthetic = SYNTHETIC_CFG_TYPES.has(type);
+    const id = isSynthetic ? nid() : (an ? (this.nm.get(an) ?? nid()) : nid());
     if(!this.nodes.find(n=>n.id===id)){
       const{defs,uses}=an?extractDefsUses(an):{defs:[],uses:[]};
-      this.nodes.push({id,label,type,full_label:label,...loc(an??{}),file:this.rel,full_path:this.rel,defs,uses});
+      // Use descriptive label from AST node when available
+      const richLabel = an ? getNodeLabel(an) : label;
+      // Mark synthetic nodes with ast_ref for traceability
+      const node = {
+        id,
+        label: richLabel,
+        type,
+        full_label: label,  // Keep original label as full_label
+        code_snippet: richLabel,  // Add code snippet field
+        ...loc(an??{}),
+        file: this.rel,
+        full_path: this.rel,
+        defs,
+        uses,
+        ...extraAttrs
+      };
+      if(isSynthetic && an) node.ast_ref = this.nm.get(an) ?? -1;
+      this.nodes.push(node);
     }
     return id;
   }
@@ -958,6 +1168,70 @@ function computePDG(cfgNodes, cfgEdges, ddgEdges) {
 // ─────────────────────────────────────────────────────────────
 // 14.  Unified CPG  (fix #10 deduplicated edges)
 // ─────────────────────────────────────────────────────────────
+
+// New CPG builder that includes DDG nodes
+function buildCPGWithDDG(astN, astE, cfgN, cfgE, ddgN, ddgE, ddgLegacyE, pdgE) {
+  const unified = new Map();
+  const astIdSet = new Set(astN.map(n => n.id));
+  const cfgIdSet = new Set(cfgN.map(n => n.id));
+
+  // Add all AST nodes
+  for (const n of astN) {
+    unified.set(n.id, {...n, sources: ['AST'], ast_id: n.id, cfg_id: -1, ddg_id: -1});
+  }
+
+  // Add CFG nodes (merge if exists, otherwise add new)
+  for (const n of cfgN) {
+    if (unified.has(n.id)) {
+      const u = unified.get(n.id);
+      if (!u.sources.includes('CFG')) {
+        u.sources.push('CFG');
+        u.cfg_id = n.id;
+        // Preserve richer label from CFG
+        if (n.code_snippet) u.code_snippet = n.code_snippet;
+      }
+    } else {
+      unified.set(n.id, {...n, sources: ['CFG'], ast_id: -1, cfg_id: n.id, ddg_id: -1});
+    }
+  }
+
+  // Add DDG nodes (these are always new - ASSIGN_TARGET, VAR_USE, etc.)
+  for (const n of ddgN) {
+    if (unified.has(n.id)) {
+      const u = unified.get(n.id);
+      if (!u.sources.includes('DDG')) {
+        u.sources.push('DDG');
+        u.ddg_id = n.id;
+      }
+    } else {
+      unified.set(n.id, {...n, sources: ['DDG'], ast_id: n.ast_ref ?? -1, cfg_id: -1, ddg_id: n.id});
+    }
+  }
+
+  // Deduplicate and collect edges
+  const seen = new Set();
+  const uEdges = [];
+
+  function addE(e) {
+    const s = e.src, d = e.dst;
+    if (!unified.has(s) || !unified.has(d)) return;
+    const k = `${s}|${d}|${e.edge_type}`;
+    if (seen.has(k)) return;
+    seen.add(k);
+    uEdges.push(e);
+  }
+
+  // Add all edge types
+  for (const e of astE) addE(e);
+  for (const e of cfgE) addE(e);
+  for (const e of ddgE) addE(e);           // New DDG edges with dedicated nodes
+  for (const e of ddgLegacyE) addE(e);     // Legacy REACHING_DEF edges
+  if (pdgE) for (const e of pdgE) addE(e);
+
+  return {nodes: [...unified.values()], edges: uEdges};
+}
+
+// Legacy CPG builder (kept for backward compatibility)
 function buildCPG(astN,astE,cfgN,cfgE,ddgE,pdgE) {
   const unified=new Map();
   const astIdSet=new Set(astN.map(n=>n.id));
@@ -1036,15 +1310,26 @@ function analyzeFile(fp, rel, code, fileIndex) {
 
   const sw=new ScopeWalker(rel,nodeIdMap);
   sw.walk(ast);
-  const ddgE=sw.buildDDGEdges();
-  const pdgE=computePDG(cfgB.nodes,cfgB.edges,ddgE);
-  const cpg=buildCPG(aN,aE,cfgB.nodes,cfgB.edges,ddgE,pdgE);
+
+  // Build DDG with dedicated nodes (new approach)
+  const ddgResult = sw.buildDDG();
+  const ddgNodes = ddgResult.nodes;
+  const ddgEdges = ddgResult.edges;
+
+  // Also get legacy edges for backward compatibility
+  const ddgLegacyEdges = sw.buildDDGEdges();
+
+  const pdgE=computePDG(cfgB.nodes,cfgB.edges,ddgLegacyEdges);
+
+  // Build CPG including DDG nodes
+  const cpg=buildCPGWithDDG(aN,aE,cfgB.nodes,cfgB.edges,ddgNodes,ddgEdges,ddgLegacyEdges,pdgE);
   const dynamic=extractDynamic(ast,rel);
 
   return{
     ast:{nodes:aN,edges:aE},
     cfg:{nodes:cfgB.nodes,edges:cfgB.edges},
-    ddg:{nodes:cfgB.nodes,edges:ddgE},
+    ddg:{nodes:ddgNodes,edges:ddgEdges},  // Now includes dedicated DDG nodes
+    ddg_legacy:{edges:ddgLegacyEdges},    // Keep legacy edges for compatibility
     pdg:{edges:pdgE},
     cpg:{nodes:cpg.nodes,edges:cpg.edges},
     dynamic,
@@ -1120,7 +1405,7 @@ async function main(){
   for(const[r,t]of Object.entries(tsm.types??{}))tp.tt.set(r,new Map(Object.entries(t)));
 
   // Phase 2: per-file graph construction (workers — fix #1 workers have no cross-file state)
-  const allAstN=[],allCfgN=[],allCfgE=[],allDdgE=[],allAstE=[];
+  const allAstN=[],allCfgN=[],allCfgE=[],allDdgN=[],allDdgE=[],allDdgLegacyE=[],allAstE=[];
   let fileIndex=0;
 
   for(const[rel,{fp,code,ast}]of preAsts){
@@ -1134,10 +1419,12 @@ async function main(){
       failAudit[cat]=(failAudit[cat]??0)+1;
       continue;
     }
-    const{ast:aG,cfg,ddg,pdg,cpg,dynamic}=result;
+    const{ast:aG,cfg,ddg,ddg_legacy,pdg,cpg,dynamic}=result;
     allAstN.push(...aG.nodes);allAstE.push(...aG.edges);
     allCfgN.push(...cfg.nodes);allCfgE.push(...cfg.edges);
-    allDdgE.push(...ddg.edges);
+    allDdgN.push(...ddg.nodes);        // Dedicated DDG nodes (ASSIGN_TARGET, VAR_USE)
+    allDdgE.push(...ddg.edges);        // DDG edges between dedicated nodes
+    allDdgLegacyE.push(...(ddg_legacy?.edges || []));  // Legacy REACHING_DEF edges
 
     // Decorators run in main thread (have classMap) — fix #11 decorator ordering
     const decs=extractDecorators(ast,rel,classMap);
@@ -1173,8 +1460,8 @@ async function main(){
   // IFDG
   const ifdg=buildIFDG(fps,resolver,analyzer);
 
-  // Global unified CPG + cross-file edges
-  const ucpg=buildCPG(allAstN,allAstE,allCfgN,allCfgE,allDdgE,[]);
+  // Global unified CPG + cross-file edges (now includes DDG nodes)
+  const ucpg=buildCPGWithDDG(allAstN,allAstE,allCfgN,allCfgE,allDdgN,allDdgE,allDdgLegacyE,[]);
   const{edges:finalEdges,icfgCount,xDDGCount}=addCrossFileEdges(ucpg.nodes,ucpg.edges,analyzer);
   ucpg.edges=finalEdges;
 

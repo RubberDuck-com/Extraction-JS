@@ -164,6 +164,30 @@ def inspect_pickle(pkl_path):
     print(f"    {'Inter-file deps':<25} {bg['inter_file_deps']:>10} {fg['inter_file_deps']:>10}")
     print(f"    {'ICFG edges':<25} {bg['icfg_edges']:>10} {fg['icfg_edges']:>10}")
 
+    # Check for DDG nodes
+    orig_ddg = inst.graphs.get("original", {}).get("file_level", {}).get("DDG", {})
+    if orig_ddg:
+        first_file = list(orig_ddg.keys())[0] if orig_ddg else None
+        if first_file and hasattr(orig_ddg[first_file], 'nodes'):
+            sample_nodes = list(orig_ddg[first_file].nodes(data=True))[:3]
+            print(f"\n  Sample DDG nodes from {first_file}:")
+            for nid, attrs in sample_nodes:
+                node_type = attrs.get('type', 'unknown')
+                label = str(attrs.get('label', ''))[:40]
+                print(f"    {nid}: type={node_type}, label={label}")
+
+    # Check for CFG labels
+    orig_cfg = inst.graphs.get("original", {}).get("file_level", {}).get("CFG", {})
+    if orig_cfg:
+        first_file = list(orig_cfg.keys())[0] if orig_cfg else None
+        if first_file and hasattr(orig_cfg[first_file], 'nodes'):
+            sample_nodes = list(orig_cfg[first_file].nodes(data=True))[:5]
+            print(f"\n  Sample CFG nodes from {first_file}:")
+            for nid, attrs in sample_nodes:
+                node_type = attrs.get('type', 'unknown')
+                label = str(attrs.get('label', ''))[:50]
+                print(f"    {nid}: type={node_type}, label={label}")
+
     # Show file-level graphs available
     print(f"\n  Available Graph Types:")
     file_graphs = inst.graphs["original"]["file_level"]
