@@ -903,6 +903,7 @@ def load_csv(csv_path: str, max_n: int=0) -> list:
 # ─────────────────────────────────────────────────────────────
 
 def main():
+    global AUTO_RESTART, MAX_WORKERS
     import tempfile
     # fix #21: required on Windows for ProcessPoolExecutor spawn
     multiprocessing.freeze_support()
@@ -917,7 +918,6 @@ def main():
     ap.add_argument("--no-restart",    action="store_true")
     args=ap.parse_args()
 
-    global AUTO_RESTART, MAX_WORKERS
     if args.no_restart: AUTO_RESTART=False
     MAX_WORKERS=args.workers
 
