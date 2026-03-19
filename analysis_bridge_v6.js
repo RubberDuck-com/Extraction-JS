@@ -1683,10 +1683,18 @@ function extractDefsUses(node) {
 const SYNTHETIC_CFG_TYPES = new Set([
   'ENTRY', 'EXIT', 'JOIN', 'LABEL_JOIN', 'SWITCH_JOIN', 'OPT_JOIN',
   'TRY', 'CATCH', 'FINALLY',
-  // NEW: Logical and ternary synthetic nodes
+  // Logical and ternary synthetic nodes
   'LOGICAL_JOIN', 'TERNARY_JOIN',
   'LogicalLeft', 'LogicalRight',
-  'TernaryTest', 'TernaryTrue', 'TernaryFalse'
+  'TernaryTest', 'TernaryTrue', 'TernaryFalse',
+  // Loop and switch synthetic nodes
+  'LOOP_EXIT', 'SwitchCase', 'DefaultCase',
+  // Optional chaining synthetic nodes
+  'OptionalMember', 'OPT_MEMBER_JOIN', 'OptionalCall',
+  // Class-related synthetic nodes
+  'StaticBlock', 'ClassMethod', 'ClassPrivateMethod', 'ClassProperty', 'ClassPrivateProperty',
+  // Other synthetic nodes
+  'DefaultValue', 'DEFAULT_JOIN', 'SequenceItem', 'WithStatement', 'DebuggerStatement'
 ]);
 
 // Helper to generate descriptive labels from AST nodes
@@ -1821,30 +1829,122 @@ class CFGBuilder {
     switch(s.type){
       case 'IfStatement':{
         const c=this._n(`IF:${s.loc?.start?.line}`,'IfStatement',s);
-        const tr=this._block(this._ss(s.consequent),[c],ctx);
-        if(tr.firstNode)this._e(c,tr.firstNode,'CFG',{condition:'true'});
-        let fE=[c];
-        if(s.alternate){const fl=this._block(this._ss(s.alternate),[c],ctx);if(fl.firstNode)this._e(c,fl.firstNode,'CFG',{condition:'false'});fE=fl.exits;}
+
+        // Extract CallExpressions from condition
+        const condNodes = [];
+        const walkCond = (expr) => {
+          if(!expr) return;
+          if(expr.type === 'CallExpression') {
+            const cn = this._n(`COND_CALL:${expr.loc?.start?.line}`, 'CallExpression', expr, {
+              callee_name: expr.callee?.name ?? expr.callee?.property?.name ?? '<expr>',
+              arg_count: expr.arguments?.length ?? 0,
+              in_condition: true
+            });
+            condNodes.push(cn);
+            expr.arguments?.forEach(a => walkCond(a));
+          }
+          if(expr.left) walkCond(expr.left);
+          if(expr.right) walkCond(expr.right);
+          if(expr.object) walkCond(expr.object);
+          if(expr.callee) walkCond(expr.callee);
+          if(expr.argument) walkCond(expr.argument);
+          if(expr.test) walkCond(expr.test);
+          if(expr.consequent) walkCond(expr.consequent);
+          if(expr.alternate) walkCond(expr.alternate);
+        };
+        walkCond(s.test);
+
+        // Chain condition nodes
+        let prev = c;
+        for(const cn of condNodes) {
+          this._e(prev, cn, 'CFG', {condition_eval: true});
+          prev = cn;
+        }
+
+        // Don't pass predecessors to _block - add edges manually with conditions
+        const tr=this._block(this._ss(s.consequent),[],ctx);
+        if(tr.firstNode)this._e(prev,tr.firstNode,'CFG',{condition:'true',branch:'consequent'});
+        else this._e(prev,prev,'CFG',{condition:'true',branch:'consequent',empty_branch:true});
+        let fE=[prev];
+        if(s.alternate){
+          const fl=this._block(this._ss(s.alternate),[],ctx);
+          if(fl.firstNode)this._e(prev,fl.firstNode,'CFG',{condition:'false',branch:'alternate'});
+          fE=fl.exits;
+        } else {
+          fE=[prev];
+        }
         const j=this._n(`JOIN:${s.loc?.end?.line}`,'JOIN',s);
-        [...tr.exits,...fE].forEach(n=>this._e(n,j));
+        [...tr.exits,...(fE.length?fE:[prev])].forEach(n=>this._e(n,j));
         return{node:c,next:[j]};
       }
       case 'WhileStatement':case 'DoWhileStatement':{
         const lp=this._n(`${s.type}:${s.loc?.start?.line}`,s.type,s);
-        const bCtx={...ctx,bk:[{l:null,t:lp},...ctx.bk],ct:[{l:null,t:lp},...ctx.ct]};
-        const bd=this._block(this._ss(s.body),[lp],bCtx);
-        if(bd.firstNode)this._e(lp,bd.firstNode,'CFG',{condition:'true'});
-        bd.exits.forEach(n=>this._e(n,lp));
-        return{node:lp,next:[lp]};
+        const exitJ=this._n(`${s.type}_EXIT:${s.loc?.end?.line}`,'LOOP_EXIT',s);
+
+        // Extract CallExpressions from condition
+        const condNodes = [];
+        const walkCond = (expr) => {
+          if(!expr) return;
+          if(expr.type === 'CallExpression') {
+            const cn = this._n(`LOOP_COND_CALL:${expr.loc?.start?.line}`, 'CallExpression', expr, {
+              callee_name: expr.callee?.name ?? expr.callee?.property?.name ?? '<expr>',
+              in_condition: true
+            });
+            condNodes.push(cn);
+            expr.arguments?.forEach(a => walkCond(a));
+          }
+          if(expr.left) walkCond(expr.left);
+          if(expr.right) walkCond(expr.right);
+          if(expr.argument) walkCond(expr.argument);
+        };
+        walkCond(s.test);
+
+        // Chain condition nodes to loop header
+        let prev = lp;
+        for(const cn of condNodes) {
+          this._e(prev, cn, 'CFG', {condition_eval: true});
+          prev = cn;
+        }
+
+        const bCtx={...ctx,bk:[{l:null,t:exitJ},...ctx.bk],ct:[{l:null,t:lp},...ctx.ct]};
+        const bd=this._block(this._ss(s.body),[],bCtx);
+        if(bd.firstNode)this._e(prev,bd.firstNode,'CFG',{condition:'true',loop_body:true});
+        this._e(prev,exitJ,'CFG',{condition:'false',loop_exit:true});
+        bd.exits.forEach(n=>this._e(n,lp,'CFG',{loop_back:true}));
+        return{node:lp,next:[exitJ]};
       }
       case 'ForStatement':case 'ForInStatement':case 'ForOfStatement':{
-        const fn=this._n(`${s.type}:${s.loc?.start?.line}`,s.type,s);
-        const bCtx={...ctx,bk:[{l:null,t:fn},...ctx.bk],ct:[{l:null,t:fn},...ctx.ct]};
-        const bd=this._block(this._ss(s.body),[fn],bCtx);
-        if(bd.firstNode)this._e(fn,bd.firstNode);
-        bd.exits.forEach(n=>this._e(n,fn));
-        if(s.type==='ForOfStatement'&&s.await)this._e(fn,fn,'CFG',{edge_label:'await_iter'});
-        return{node:fn,next:[fn]};
+        // Extract loop variable info
+        const loopVar = s.left?.declarations?.[0]?.id ?? s.left;
+        const varName = loopVar?.name ?? (loopVar?.type === 'ArrayPattern' ? '[destructure]' :
+                        loopVar?.type === 'ObjectPattern' ? '{destructure}' : null);
+        const isAsync = s.type === 'ForOfStatement' && s.await;
+        const hasDestructure = loopVar?.type === 'ArrayPattern' || loopVar?.type === 'ObjectPattern';
+
+        const fn = this._n(`${s.type}:${s.loc?.start?.line}`, s.type, s, {
+          loop_variable: varName,
+          is_async_iteration: isAsync,
+          has_destructure: hasDestructure,
+          loop_kind: s.type === 'ForStatement' ? 'for' :
+                     s.type === 'ForInStatement' ? 'for-in' : 'for-of'
+        });
+        const exitJ = this._n(`${s.type}_EXIT:${s.loc?.end?.line}`, 'LOOP_EXIT', s);
+        const bCtx = {...ctx, bk:[{l:null,t:exitJ},...ctx.bk], ct:[{l:null,t:fn},...ctx.ct]};
+        const bd = this._block(this._ss(s.body), [], bCtx);
+
+        if(bd.firstNode) this._e(fn, bd.firstNode, 'CFG', {condition:'iterate', loop_body:true});
+        this._e(fn, exitJ, 'CFG', {condition:'done', loop_exit:true});
+        bd.exits.forEach(n => this._e(n, fn, 'CFG', {loop_back:true}));
+
+        // Async iteration edges
+        if(isAsync) {
+          this._e(fn, fn, 'CFG', {
+            edge_label: 'await_next',
+            async_iteration: true,
+            await_point: true
+          });
+        }
+        return {node:fn, next:[exitJ]};
       }
       case 'LabeledStatement':{
         const j=this._n(`LBJOIN:${s.loc?.end?.line}`,'LABEL_JOIN',s);
@@ -1866,33 +1966,181 @@ class CFGBuilder {
         if(t)this._e(cn,t.t,'CFG',{edge_label:'continue'});
         return{node:cn,next:[]};
       }
-      case 'ReturnStatement':{const r=this._n(`RET:${s.loc?.start?.line}`,'ReturnStatement',s);this._e(r,ctx.fe);return{node:r,next:[]};}
       case 'ThrowStatement':{const t=this._n(`THR:${s.loc?.start?.line}`,'ThrowStatement',s);this._e(t,ctx.fe);return{node:t,next:[]};}
       case 'TryStatement':{
         const t=this._n(`TRY:${s.loc?.start?.line}`,'TRY',s);
-        const tb=this._block(s.block.body,[t],ctx);
+        const tb=this._block(s.block.body,[],ctx);
+        // Connect TRY to try block body
+        if(tb.firstNode)this._e(t,tb.firstNode,'CFG',{condition:'try_body',try_block:true});
         let ce=[];
-        if(s.handler){const c=this._n(`CATCH:${s.handler.loc?.start?.line}`,'CATCH',s.handler);this._e(t,c,'CFG',{condition:'exception'});ce=this._block(s.handler.body?.body??[],[c],ctx).exits;}
-        if(s.finalizer){const f=this._n(`FIN:${s.finalizer.loc?.start?.line}`,'FINALLY',s.finalizer);[...tb.exits,...ce].forEach(n=>this._e(n,f));return{node:t,next:[f]};}
+        if(s.handler){
+          const catchParam=s.handler.param?.name??'error';
+          const c=this._n(`CATCH(${catchParam}):${s.handler.loc?.start?.line}`,'CATCH',s.handler,{catch_param:catchParam});
+          // Exception edge from TRY to CATCH
+          this._e(t,c,'CFG',{condition:'exception',exception_handler:true});
+          // Any statement in try block can throw to catch
+          for(const n of tb.exits)this._e(n,c,'CFG',{condition:'exception',implicit_throw:true});
+          const cb=this._block(s.handler.body?.body??[],[],ctx);
+          if(cb.firstNode)this._e(c,cb.firstNode,'CFG',{catch_body:true});
+          ce=cb.exits.length?cb.exits:[c];
+        }
+        if(s.finalizer){
+          const f=this._n(`FINALLY:${s.finalizer.loc?.start?.line}`,'FINALLY',s.finalizer);
+          [...tb.exits,...ce].forEach(n=>this._e(n,f,'CFG',{finally_entry:true}));
+          const fb=this._block(s.finalizer.body,[],ctx);
+          if(fb.firstNode)this._e(f,fb.firstNode,'CFG',{finally_body:true});
+          const fExits=fb.exits.length?fb.exits:[f];
+          return{node:t,next:fExits};
+        }
         return{node:t,next:[...tb.exits,...ce]};
       }
       case 'SwitchStatement':{
         const sw=this._n(`SW:${s.loc?.start?.line}`,'SwitchStatement',s);
+
+        // Extract CallExpressions from discriminant
+        const discNodes = [];
+        const walkDisc = (expr) => {
+          if(!expr) return;
+          if(expr.type === 'CallExpression') {
+            const cn = this._n(`SW_DISC_CALL:${expr.loc?.start?.line}`, 'CallExpression', expr, {
+              callee_name: expr.callee?.name ?? expr.callee?.property?.name ?? '<expr>',
+              in_switch_discriminant: true
+            });
+            discNodes.push(cn);
+            expr.arguments?.forEach(a => walkDisc(a));
+          }
+          if(expr.left) walkDisc(expr.left);
+          if(expr.right) walkDisc(expr.right);
+          if(expr.argument) walkDisc(expr.argument);
+          if(expr.object) walkDisc(expr.object);
+          if(expr.callee) walkDisc(expr.callee);
+        };
+        walkDisc(s.discriminant);
+
+        let prev = sw;
+        for(const dn of discNodes) {
+          this._e(prev, dn, 'CFG', {discriminant_eval: true});
+          prev = dn;
+        }
+
         const j=this._n(`SWJOIN:${s.loc?.end?.line}`,'SWITCH_JOIN',s);
         const bCtx={...ctx,bk:[{l:null,t:j},...ctx.bk]};
-        let ft=[sw];
-        for(const c of s.cases){const r=this._block(c.consequent,ft,bCtx);if(r.firstNode)this._e(sw,r.firstNode);ft=r.exits;}
+        let ft=[];
+        let hasDefault=false;
+        const switchHead = prev;  // Last discriminant node (or sw if no discriminant calls)
+        for(let i=0;i<s.cases.length;i++){
+          const c=s.cases[i];
+          const caseLabel=c.test?`case ${c.test.value??c.test.name??'...'}`:null;
+          if(!c.test)hasDefault=true;
+          const caseNode=this._n(`CASE:${c.loc?.start?.line}`,c.test?'SwitchCase':'DefaultCase',c);
+          this._e(switchHead,caseNode,'CFG',{condition:caseLabel??'default',case_index:i,is_default:!c.test});
+          const r=this._block(c.consequent,[],bCtx);
+          if(r.firstNode)this._e(caseNode,r.firstNode,'CFG',{case_body:true});
+          // Fall-through from previous case
+          ft.forEach(n=>this._e(n,caseNode,'CFG',{fall_through:true}));
+          ft=r.exits.length?r.exits:[caseNode];
+        }
+        // If no default, switch can skip all cases
+        if(!hasDefault)this._e(switchHead,j,'CFG',{condition:'no_match',switch_skip:true});
         ft.forEach(n=>this._e(n,j));
         return{node:sw,next:[j]};
       }
       case 'ExpressionStatement':{
         const n=this._n(`ES:${s.loc?.start?.line}`,s.type,s);
-        if(ctx.isAsync&&s.expression?.type==='AwaitExpression')this._e(n,n,'CFG',{edge_label:'await_suspend'});
-        return{node:n,next:[n]};
+
+        // Create sub-nodes for important expressions within the statement
+        const exprNodes = [];
+        const walkExpr = (expr, parent) => {
+          if(!expr) return;
+          if(expr.type === 'CallExpression') {
+            const callNode = this._n(`CALL:${expr.loc?.start?.line}`, 'CallExpression', expr, {
+              callee_name: expr.callee?.name ?? expr.callee?.property?.name ?? '<expr>',
+              arg_count: expr.arguments?.length ?? 0,
+              can_throw: true
+            });
+            exprNodes.push(callNode);
+            expr.arguments?.forEach(a => walkExpr(a, expr));
+          } else if(expr.type === 'NewExpression') {
+            const newNode = this._n(`NEW:${expr.loc?.start?.line}`, 'NewExpression', expr, {
+              class_name: expr.callee?.name ?? '<expr>',
+              arg_count: expr.arguments?.length ?? 0,
+              constructor_call: true
+            });
+            exprNodes.push(newNode);
+            expr.arguments?.forEach(a => walkExpr(a, expr));  // Walk constructor arguments
+          } else if(expr.type === 'AwaitExpression') {
+            const awaitNode = this._n(`AWAIT:${expr.loc?.start?.line}`, 'AwaitExpression', expr, {
+              await_point: true
+            });
+            exprNodes.push(awaitNode);
+            walkExpr(expr.argument, expr);
+          } else if(expr.type === 'AssignmentExpression') {
+            const assignNode = this._n(`ASSIGN:${expr.loc?.start?.line}`, 'AssignmentExpression', expr, {
+              operator: expr.operator,
+              target: expr.left?.name ?? expr.left?.type
+            });
+            exprNodes.push(assignNode);
+            walkExpr(expr.right, expr);
+          } else if(expr.type === 'ConditionalExpression') {
+            // Ternary handled separately in _stmt
+          } else if(expr.type === 'LogicalExpression') {
+            // Short-circuit handled separately in _stmt
+          }
+          // Recurse into sub-expressions
+          if(expr.left) walkExpr(expr.left, expr);
+          if(expr.right) walkExpr(expr.right, expr);
+          if(expr.object) walkExpr(expr.object, expr);
+          if(expr.callee) walkExpr(expr.callee, expr);
+          if(expr.argument) walkExpr(expr.argument, expr);  // UnaryExpression, SpreadElement
+          if(expr.test) walkExpr(expr.test, expr);  // ConditionalExpression
+          if(expr.consequent) walkExpr(expr.consequent, expr);
+          if(expr.alternate) walkExpr(expr.alternate, expr);
+          if(expr.elements) expr.elements.forEach(e => walkExpr(e, expr));  // ArrayExpression
+          if(expr.properties) expr.properties.forEach(p => walkExpr(p.value ?? p.argument, expr));  // ObjectExpression
+          if(expr.expressions) expr.expressions.forEach(e => walkExpr(e, expr));  // SequenceExpression
+        };
+        walkExpr(s.expression, s);
+
+        // Chain expression nodes to statement node
+        let prev = n;
+        for(const en of exprNodes) {
+          this._e(prev, en, 'CFG', {expression_flow: true});
+          prev = en;
+        }
+
+        // Check for await
+        const hasAwait = ctx.isAsync && exprNodes.some(en => this.nodes.find(x => x.id === en)?.type === 'AwaitExpression');
+        if(hasAwait) {
+          this._e(prev, prev, 'CFG', {
+            edge_label: 'await_suspend',
+            await_point: true,
+            can_throw: true
+          });
+        }
+        return{node:n,next:[prev]};
+      }
+      case 'AwaitExpression':{
+        const aw=this._n(`AWAIT:${s.loc?.start?.line}`,'AwaitExpression',s,{
+          awaited_type: s.argument?.type
+        });
+        if(ctx.isAsync){
+          this._e(aw, aw, 'CFG', {
+            edge_label: 'await_suspend',
+            await_point: true,
+            can_throw: true
+          });
+        }
+        return{node:aw,next:[aw]};
       }
       case 'YieldExpression':{
-        const y=this._n(`YIELD:${s.loc?.start?.line}`,'YieldExpression',s);
-        if(ctx.isGen){this._e(y,ctx.fe,'CFG',{edge_label:'yield'});this._e(y,y,'CFG',{edge_label:'yield_resume'});}
+        const y=this._n(`YIELD:${s.loc?.start?.line}`,'YieldExpression',s,{
+          is_delegate: s.delegate,  // yield* vs yield
+          yielded_type: s.argument?.type
+        });
+        if(ctx.isGen){
+          this._e(y, ctx.fe, 'CFG', {edge_label:'yield', yield_point:true});
+          this._e(y, y, 'CFG', {edge_label:'yield_resume', can_receive_value:true});
+        }
         return{node:y,next:[y]};
       }
       case 'OptionalCallExpression':{
@@ -1936,6 +2184,224 @@ class CFGBuilder {
         this._e(alt, join, 'CFG');
 
         return {node: test, next: [join]};
+      }
+
+      // Optional member expression - obj?.prop branching
+      case 'OptionalMemberExpression': {
+        const om = this._n(`OM:${s.loc?.start?.line}`, 'OptionalMember', s, {
+          property: s.property?.name ?? s.property?.value,
+          computed: s.computed,
+          optional: s.optional
+        });
+        const oj = this._n(`OMJ:${s.loc?.end?.line}`, 'OPT_MEMBER_JOIN', s);
+        this._e(om, oj, 'CFG', {condition: 'not_nullish', optional_access: true});
+        this._e(om, oj, 'CFG', {condition: 'nullish', optional_skip: true, short_circuit: true});
+        return {node: om, next: [oj]};
+      }
+
+      // Class static block - static { ... }
+      case 'StaticBlock': {
+        const sb = this._n(`STATIC_BLOCK:${s.loc?.start?.line}`, 'StaticBlock', s);
+        const bd = this._block(s.body, [], ctx);
+        if(bd.firstNode) this._e(sb, bd.firstNode, 'CFG', {static_block_body: true});
+        return {node: sb, next: bd.exits.length ? bd.exits : [sb]};
+      }
+
+      // Debugger statement
+      case 'DebuggerStatement': {
+        const db = this._n(`DEBUGGER:${s.loc?.start?.line}`, 'DebuggerStatement', s);
+        return {node: db, next: [db]};
+      }
+
+      // With statement (deprecated but exists)
+      case 'WithStatement': {
+        const w = this._n(`WITH:${s.loc?.start?.line}`, 'WithStatement', s);
+        const bd = this._block(this._ss(s.body), [], ctx);
+        if(bd.firstNode) this._e(w, bd.firstNode, 'CFG', {with_body: true});
+        return {node: w, next: bd.exits.length ? bd.exits : [w]};
+      }
+
+      // Sequence expression - (a, b, c)
+      case 'SequenceExpression': {
+        if (!s.expressions?.length) return null;
+        const nodes = s.expressions.map((expr, i) =>
+          this._n(`SEQ${i}:${expr.loc?.start?.line}`, 'SequenceItem', expr, {sequence_index: i})
+        );
+        // Chain sequence items
+        for (let i = 0; i < nodes.length - 1; i++) {
+          this._e(nodes[i], nodes[i+1], 'CFG', {sequence_next: true});
+        }
+        return {node: nodes[0], next: [nodes[nodes.length - 1]]};
+      }
+
+      // AssignmentPattern - destructuring with default value
+      case 'AssignmentPattern': {
+        const ap = this._n(`DEFAULT:${s.loc?.start?.line}`, 'DefaultValue', s, {
+          target: s.left?.name ?? s.left?.type,
+          has_default: true
+        });
+        const apj = this._n(`DEFAULTJ:${s.loc?.end?.line}`, 'DEFAULT_JOIN', s);
+        // If value is undefined, use default
+        this._e(ap, apj, 'CFG', {condition: 'has_value', default_skip: true});
+        this._e(ap, apj, 'CFG', {condition: 'undefined', default_use: true});
+        return {node: ap, next: [apj]};
+      }
+
+      // VariableDeclaration - extract expression sub-nodes from initializers
+      case 'VariableDeclaration': {
+        const n = this._n(`VAR:${s.loc?.start?.line}`, s.type, s, {var_kind: s.kind});
+        const exprNodes = [];
+
+        const walkExpr = (expr) => {
+          if(!expr) return;
+          if(expr.type === 'CallExpression') {
+            const callNode = this._n(`CALL:${expr.loc?.start?.line}`, 'CallExpression', expr, {
+              callee_name: expr.callee?.name ?? expr.callee?.property?.name ?? '<expr>',
+              arg_count: expr.arguments?.length ?? 0,
+              can_throw: true
+            });
+            exprNodes.push(callNode);
+            expr.arguments?.forEach(a => walkExpr(a));
+          } else if(expr.type === 'NewExpression') {
+            const newNode = this._n(`NEW:${expr.loc?.start?.line}`, 'NewExpression', expr, {
+              class_name: expr.callee?.name ?? '<expr>',
+              arg_count: expr.arguments?.length ?? 0,
+              constructor_call: true
+            });
+            exprNodes.push(newNode);
+            expr.arguments?.forEach(a => walkExpr(a));
+          } else if(expr.type === 'AwaitExpression') {
+            const awaitNode = this._n(`AWAIT:${expr.loc?.start?.line}`, 'AwaitExpression', expr);
+            exprNodes.push(awaitNode);
+            walkExpr(expr.argument);
+          }
+          // Recurse into sub-expressions
+          if(expr.left) walkExpr(expr.left);
+          if(expr.right) walkExpr(expr.right);
+          if(expr.object) walkExpr(expr.object);
+          if(expr.callee) walkExpr(expr.callee);
+          if(expr.argument) walkExpr(expr.argument);  // UnaryExpression, SpreadElement
+          if(expr.test) walkExpr(expr.test);  // ConditionalExpression
+          if(expr.consequent) walkExpr(expr.consequent);  // ConditionalExpression
+          if(expr.alternate) walkExpr(expr.alternate);  // ConditionalExpression
+          if(expr.elements) expr.elements.forEach(e => walkExpr(e));  // ArrayExpression
+          if(expr.properties) expr.properties.forEach(p => walkExpr(p.value ?? p.argument));  // ObjectExpression
+          if(expr.expressions) expr.expressions.forEach(e => walkExpr(e));  // SequenceExpression
+        };
+
+        for(const decl of s.declarations ?? []) {
+          if(decl.init) walkExpr(decl.init);
+        }
+
+        let prev = n;
+        for(const en of exprNodes) {
+          this._e(prev, en, 'CFG', {expression_flow: true});
+          prev = en;
+        }
+        return {node: n, next: [prev]};
+      }
+
+      // ReturnStatement - extract expression sub-nodes from argument
+      case 'ReturnStatement': {
+        const n = this._n(`RET:${s.loc?.start?.line}`, 'ReturnStatement', s, {
+          has_value: !!s.argument,
+          value_type: s.argument?.type
+        });
+        const exprNodes = [];
+
+        const walkExpr = (expr) => {
+          if(!expr) return;
+          if(expr.type === 'CallExpression') {
+            const callNode = this._n(`CALL:${expr.loc?.start?.line}`, 'CallExpression', expr, {
+              callee_name: expr.callee?.name ?? expr.callee?.property?.name ?? '<expr>',
+              arg_count: expr.arguments?.length ?? 0,
+              can_throw: true
+            });
+            exprNodes.push(callNode);
+            expr.arguments?.forEach(a => walkExpr(a));
+          } else if(expr.type === 'NewExpression') {
+            const newNode = this._n(`NEW:${expr.loc?.start?.line}`, 'NewExpression', expr, {
+              class_name: expr.callee?.name ?? '<expr>',
+              arg_count: expr.arguments?.length ?? 0,
+              constructor_call: true
+            });
+            exprNodes.push(newNode);
+            expr.arguments?.forEach(a => walkExpr(a));
+          } else if(expr.type === 'AwaitExpression') {
+            const awaitNode = this._n(`AWAIT:${expr.loc?.start?.line}`, 'AwaitExpression', expr);
+            exprNodes.push(awaitNode);
+            walkExpr(expr.argument);
+          }
+          // Recurse into sub-expressions
+          if(expr.left) walkExpr(expr.left);
+          if(expr.right) walkExpr(expr.right);
+          if(expr.object) walkExpr(expr.object);
+          if(expr.callee) walkExpr(expr.callee);
+          if(expr.argument) walkExpr(expr.argument);
+          if(expr.test) walkExpr(expr.test);
+          if(expr.consequent) walkExpr(expr.consequent);
+          if(expr.alternate) walkExpr(expr.alternate);
+          if(expr.elements) expr.elements.forEach(e => walkExpr(e));
+          if(expr.properties) expr.properties.forEach(p => walkExpr(p.value ?? p.argument));
+          if(expr.expressions) expr.expressions.forEach(e => walkExpr(e));
+        };
+
+        if(s.argument) walkExpr(s.argument);
+
+        let prev = n;
+        for(const en of exprNodes) {
+          this._e(prev, en, 'CFG', {expression_flow: true});
+          prev = en;
+        }
+
+        // Connect return to function exit
+        this._e(prev, ctx.fe, 'CFG', {edge_label: 'return'});
+        return {node: n, next: []};
+      }
+
+      // Empty statement
+      case 'EmptyStatement': {
+        const es = this._n(`EMPTY:${s.loc?.start?.line}`, 'EmptyStatement', s);
+        return {node: es, next: [es]};
+      }
+
+      // Class declaration/expression body
+      case 'ClassDeclaration':
+      case 'ClassExpression': {
+        const cn = this._n(`CLASS:${s.loc?.start?.line}`, s.type, s, {
+          class_name: s.id?.name ?? '<anonymous>',
+          has_superclass: !!s.superClass
+        });
+        // Process class body methods
+        if (s.body?.body) {
+          let prev = [cn];
+          for (const member of s.body.body) {
+            if (member.type === 'ClassMethod' || member.type === 'ClassPrivateMethod') {
+              const mn = this._n(`METHOD:${member.loc?.start?.line}`, member.type, member, {
+                method_name: member.key?.name ?? member.key?.value ?? '<computed>',
+                method_kind: member.kind,  // 'constructor', 'method', 'get', 'set'
+                is_static: member.static,
+                is_async: member.async,
+                is_generator: member.generator
+              });
+              prev.forEach(p => this._e(p, mn, 'CFG', {class_member: true}));
+              prev = [mn];
+            } else if (member.type === 'StaticBlock') {
+              const sb = this._n(`STATIC_BLOCK:${member.loc?.start?.line}`, 'StaticBlock', member);
+              prev.forEach(p => this._e(p, sb, 'CFG', {class_member: true, static_block: true}));
+              prev = [sb];
+            } else if (member.type === 'ClassProperty' || member.type === 'ClassPrivateProperty') {
+              const cp = this._n(`FIELD:${member.loc?.start?.line}`, member.type, member, {
+                field_name: member.key?.name ?? '<computed>',
+                is_static: member.static,
+                has_initializer: !!member.value
+              });
+              prev.forEach(p => this._e(p, cp, 'CFG', {class_member: true, class_field: true}));
+              prev = [cp];
+            }
+          }
+        }
+        return {node: cn, next: [cn]};
       }
 
       default:{const n=this._n(`${s.type}:${s.loc?.start?.line}`,s.type,s);return{node:n,next:[n]};}
@@ -2929,24 +3395,43 @@ function buildCPG(astN,astE,cfgN,cfgE,ddgE,pdgE) {
 function addCrossFileEdges(uNodes,uEdges,analyzer){
   const lk=new Map();
   for(const n of uNodes){const f=norm(n.file??n.source_file??'');const k=`${f}:${n.line}`;if(!lk.has(k))lk.set(k,n.id);}
-  let ic=0,xd=0;const extra=[];
+  let ic=0,xd=0;
+  const extra=[];
+  const icfgEdges=[];  // Separate ICFG edges for interprocedural_cfg output
+  const xddgEdges=[];  // Separate cross-file DDG edges
+
   for(const[cf,cl]of analyzer.calls){
     for(const{calledName:cn,line:callLine,nArgs:nA}of cl){
       for(const t of analyzer.resolveCall(cf,cn,nA)){
         if(t.file===cf)continue;
         const cu=lk.get(`${cf}:${callLine}`),tu=lk.get(`${t.file}:${t.line}`);
         if(cu==null||tu==null)continue;
-        extra.push({src:cu,dst:tu,edge_type:'ICFG_CALL',called_name:cn,source_file:cf,target_file:t.file});
-        extra.push({src:tu,dst:cu,edge_type:'ICFG_RETURN',source_file:t.file,target_file:cf});ic+=2;
-        for(let i=0;i<t.params.length;i++){extra.push({src:cu,dst:tu,edge_type:'CROSS_FILE_DDG',flow_type:'arg_to_param',param_name:t.params[i],param_index:i,source_file:cf,target_file:t.file});xd++;}
-        extra.push({src:tu,dst:cu,edge_type:'CROSS_FILE_DDG',flow_type:'return_to_callsite',source_file:t.file,target_file:cf});xd++;
+
+        // ICFG edges
+        const icfgCall={src:cu,dst:tu,edge_type:'ICFG_CALL',called_name:cn,source_file:cf,target_file:t.file,cross_file:true};
+        const icfgReturn={src:tu,dst:cu,edge_type:'ICFG_RETURN',source_file:t.file,target_file:cf,cross_file:true};
+        extra.push(icfgCall, icfgReturn);
+        icfgEdges.push(icfgCall, icfgReturn);
+        ic+=2;
+
+        // Cross-file DDG edges
+        for(let i=0;i<t.params.length;i++){
+          const argEdge={src:cu,dst:tu,edge_type:'CROSS_FILE_DDG',flow_type:'arg_to_param',param_name:t.params[i],param_index:i,source_file:cf,target_file:t.file,cross_file:true};
+          extra.push(argEdge);
+          xddgEdges.push(argEdge);
+          xd++;
+        }
+        const retEdge={src:tu,dst:cu,edge_type:'CROSS_FILE_DDG',flow_type:'return_to_callsite',source_file:t.file,target_file:cf,cross_file:true};
+        extra.push(retEdge);
+        xddgEdges.push(retEdge);
+        xd++;
       }
     }
   }
   // deduplicate cross-file edges too
   const seen=new Set(uEdges.map(e=>`${e.src}|${e.dst}|${e.edge_type}`));
   const de=extra.filter(e=>{const k=`${e.src}|${e.dst}|${e.edge_type}`;if(seen.has(k))return false;seen.add(k);return true;});
-  return{edges:[...uEdges,...de],icfgCount:ic,xDDGCount:xd};
+  return{edges:[...uEdges,...de],icfgCount:ic,xDDGCount:xd,icfgEdges,xddgEdges};
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -2992,9 +3477,34 @@ function analyzeFile(fp, rel, code, fileIndex) {
 
   const{nodes:aN,edges:aE,nodeIdMap}=buildAST(ast,rel);
   const cfgB=new CFGBuilder(rel,nodeIdMap);
+
+  // Process all functions
   for(const{node,name,isAsync,isGen}of extractFunctions(ast,rel))
     cfgB.buildFunc(node,name,isAsync,isGen);
-  cfgB.finalize();
+
+  // Process module-level statements (top-level code)
+  if(ast.program?.body?.length) {
+    const moduleEntry = cfgB._n('ENTRY:<module>', 'ENTRY', ast.program, {is_module: true});
+    const moduleExit = cfgB._n('EXIT:<module>', 'EXIT', ast.program, {is_module: true});
+    const topLevelStmts = ast.program.body.filter(s =>
+      s.type !== 'FunctionDeclaration' &&
+      s.type !== 'ClassDeclaration' &&
+      s.type !== 'ImportDeclaration' &&
+      s.type !== 'ExportNamedDeclaration' &&
+      s.type !== 'ExportDefaultDeclaration' &&
+      s.type !== 'ExportAllDeclaration'
+    );
+    if(topLevelStmts.length) {
+      const ctx = {fe: moduleExit, isAsync: false, isGen: false, bk: [], ct: []};
+      const result = cfgB._block(topLevelStmts, [moduleEntry], ctx);
+      if(result.firstNode) cfgB._e(moduleEntry, result.firstNode, 'CFG', {module_body: true});
+      result.exits.forEach(n => cfgB._e(n, moduleExit, 'CFG', {module_exit: true}));
+    } else {
+      cfgB._e(moduleEntry, moduleExit, 'CFG', {empty_module: true});
+    }
+  }
+
+  // cfgB.finalize();  // Disabled: preserve all statement nodes for ML training
 
   const sw=new ScopeWalker(rel,nodeIdMap);
   sw.walk(ast);
@@ -3287,14 +3797,19 @@ async function main(){
 
   // Global unified CPG + cross-file edges (now includes DDG nodes)
   const ucpg=buildCPGWithDDG(allAstN,allAstE,allCfgN,allCfgE,allDdgN,allDdgE,allDdgLegacyE,[]);
-  const{edges:finalEdges,icfgCount,xDDGCount}=addCrossFileEdges(ucpg.nodes,ucpg.edges,analyzer);
+  const{edges:finalEdges,icfgCount,xDDGCount,icfgEdges,xddgEdges}=addCrossFileEdges(ucpg.nodes,ucpg.edges,analyzer);
   ucpg.edges=finalEdges;
 
   // fix #19 unified_cpg on own line
   emit({type:'unified_cpg',nodes:ucpg.nodes,edges:ucpg.edges});
 
-  // fix #5: interprocedural_cfg on own line
-  emit({type:'interprocedural_cfg',nodes:allCfgN,edges:allCfgE});
+  // fix #5: interprocedural_cfg on own line - include cross-file ICFG edges
+  const allIcfgEdges = [...allCfgE, ...icfgEdges];
+  emit({type:'interprocedural_cfg',nodes:allCfgN,edges:allIcfgEdges});
+
+  // Interprocedural DDG - cross-file data flow edges
+  const allXddgEdges = [...allDdgE, ...xddgEdges];
+  emit({type:'interprocedural_ddg',nodes:allDdgN,edges:allXddgEdges});
 
   // fix #15: ts_types on own line
   emit({type:'ts_types',types:tsm.types??{}});
