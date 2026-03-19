@@ -1806,6 +1806,124 @@ class CFGBuilder {
     if(!this.edges.find(e=>e.src===src&&e.dst===dst&&e.edge_type===et))
       this.edges.push({src,dst,edge_type:et,source_line:this.nodes.find(n=>n.id===src)?.line??-1,target_line:this.nodes.find(n=>n.id===dst)?.line??-1,...extra});
   }
+
+  // Shared helper: walk expression tree and create CFG nodes for each expression
+  _walkExpr(expr, exprNodes) {
+    if(!expr) return;
+    switch(expr.type) {
+      case 'CallExpression':
+        exprNodes.push(this._n(`CALL:${expr.loc?.start?.line}`, 'CallExpression', expr, {
+          callee_name: expr.callee?.name ?? expr.callee?.property?.name ?? '<expr>',
+          arg_count: expr.arguments?.length ?? 0, can_throw: true
+        }));
+        expr.arguments?.forEach(a => this._walkExpr(a, exprNodes));
+        break;
+      case 'NewExpression':
+        exprNodes.push(this._n(`NEW:${expr.loc?.start?.line}`, 'NewExpression', expr, {
+          class_name: expr.callee?.name ?? '<expr>',
+          arg_count: expr.arguments?.length ?? 0, constructor_call: true
+        }));
+        expr.arguments?.forEach(a => this._walkExpr(a, exprNodes));
+        break;
+      case 'AwaitExpression':
+        exprNodes.push(this._n(`AWAIT:${expr.loc?.start?.line}`, 'AwaitExpression', expr, {await_point: true}));
+        this._walkExpr(expr.argument, exprNodes);
+        break;
+      case 'AssignmentExpression':
+        exprNodes.push(this._n(`ASSIGN:${expr.loc?.start?.line}`, 'AssignmentExpression', expr, {
+          operator: expr.operator, target: expr.left?.name ?? expr.left?.type
+        }));
+        this._walkExpr(expr.left, exprNodes);
+        this._walkExpr(expr.right, exprNodes);
+        break;
+      case 'MemberExpression':
+        exprNodes.push(this._n(`MEM:${expr.loc?.start?.line}`, 'MemberExpression', expr, {
+          property: expr.property?.name ?? expr.property?.value ?? '<computed>',
+          computed: expr.computed, optional: expr.optional
+        }));
+        this._walkExpr(expr.object, exprNodes);
+        if(expr.computed) this._walkExpr(expr.property, exprNodes);
+        break;
+      case 'BinaryExpression':
+        exprNodes.push(this._n(`BIN:${expr.loc?.start?.line}`, 'BinaryExpression', expr, {operator: expr.operator}));
+        this._walkExpr(expr.left, exprNodes);
+        this._walkExpr(expr.right, exprNodes);
+        break;
+      case 'UnaryExpression':
+        exprNodes.push(this._n(`UNARY:${expr.loc?.start?.line}`, 'UnaryExpression', expr, {
+          operator: expr.operator, prefix: expr.prefix
+        }));
+        this._walkExpr(expr.argument, exprNodes);
+        break;
+      case 'UpdateExpression':
+        exprNodes.push(this._n(`UPDATE:${expr.loc?.start?.line}`, 'UpdateExpression', expr, {
+          operator: expr.operator, prefix: expr.prefix
+        }));
+        this._walkExpr(expr.argument, exprNodes);
+        break;
+      case 'LogicalExpression':
+        exprNodes.push(this._n(`LOGIC:${expr.loc?.start?.line}`, 'LogicalExpression', expr, {operator: expr.operator}));
+        this._walkExpr(expr.left, exprNodes);
+        this._walkExpr(expr.right, exprNodes);
+        break;
+      case 'ConditionalExpression':
+        exprNodes.push(this._n(`TERNARY:${expr.loc?.start?.line}`, 'ConditionalExpression', expr));
+        this._walkExpr(expr.test, exprNodes);
+        this._walkExpr(expr.consequent, exprNodes);
+        this._walkExpr(expr.alternate, exprNodes);
+        break;
+      case 'Identifier':
+        exprNodes.push(this._n(`ID:${expr.loc?.start?.line}:${expr.name}`, 'Identifier', expr, {name: expr.name}));
+        break;
+      case 'ThisExpression':
+        exprNodes.push(this._n(`THIS:${expr.loc?.start?.line}`, 'ThisExpression', expr));
+        break;
+      case 'StringLiteral': case 'NumericLiteral': case 'BooleanLiteral':
+      case 'NullLiteral': case 'RegExpLiteral':
+        exprNodes.push(this._n(`LIT:${expr.loc?.start?.line}`, expr.type, expr, {
+          value: expr.type === 'RegExpLiteral' ? expr.pattern : expr.value
+        }));
+        break;
+      case 'ArrayExpression':
+        exprNodes.push(this._n(`ARR:${expr.loc?.start?.line}`, 'ArrayExpression', expr, {
+          element_count: expr.elements?.length ?? 0
+        }));
+        expr.elements?.forEach(e => e && this._walkExpr(e, exprNodes));
+        break;
+      case 'ObjectExpression':
+        exprNodes.push(this._n(`OBJ:${expr.loc?.start?.line}`, 'ObjectExpression', expr, {
+          property_count: expr.properties?.length ?? 0
+        }));
+        expr.properties?.forEach(p => this._walkExpr(p.value ?? p.argument, exprNodes));
+        break;
+      case 'FunctionExpression': case 'ArrowFunctionExpression':
+        exprNodes.push(this._n(`FN:${expr.loc?.start?.line}`, expr.type, expr, {
+          is_async: expr.async, is_generator: expr.generator, param_count: expr.params?.length ?? 0
+        }));
+        break;
+      case 'SequenceExpression':
+        expr.expressions?.forEach(e => this._walkExpr(e, exprNodes));
+        break;
+      case 'SpreadElement':
+        exprNodes.push(this._n(`SPREAD:${expr.loc?.start?.line}`, 'SpreadElement', expr));
+        this._walkExpr(expr.argument, exprNodes);
+        break;
+      case 'TemplateLiteral':
+        exprNodes.push(this._n(`TPL:${expr.loc?.start?.line}`, 'TemplateLiteral', expr));
+        expr.expressions?.forEach(e => this._walkExpr(e, exprNodes));
+        break;
+      case 'TaggedTemplateExpression':
+        exprNodes.push(this._n(`TAG_TPL:${expr.loc?.start?.line}`, 'TaggedTemplateExpression', expr));
+        this._walkExpr(expr.tag, exprNodes);
+        this._walkExpr(expr.quasi, exprNodes);
+        break;
+      case 'YieldExpression':
+        exprNodes.push(this._n(`YIELD:${expr.loc?.start?.line}`, 'YieldExpression', expr, {delegate: expr.delegate}));
+        if(expr.argument) this._walkExpr(expr.argument, exprNodes);
+        break;
+    }
+  }
+
   buildFunc(fn,name,isAsync=false,isGen=false){
     const entry=this._n(`ENTRY:${name}`,'ENTRY',fn);
     const exit =this._n(`EXIT:${name}`, 'EXIT', fn);
@@ -1829,30 +1947,9 @@ class CFGBuilder {
     switch(s.type){
       case 'IfStatement':{
         const c=this._n(`IF:${s.loc?.start?.line}`,'IfStatement',s);
-
-        // Extract CallExpressions from condition
+        // Extract ALL expressions from condition (Joern-style)
         const condNodes = [];
-        const walkCond = (expr) => {
-          if(!expr) return;
-          if(expr.type === 'CallExpression') {
-            const cn = this._n(`COND_CALL:${expr.loc?.start?.line}`, 'CallExpression', expr, {
-              callee_name: expr.callee?.name ?? expr.callee?.property?.name ?? '<expr>',
-              arg_count: expr.arguments?.length ?? 0,
-              in_condition: true
-            });
-            condNodes.push(cn);
-            expr.arguments?.forEach(a => walkCond(a));
-          }
-          if(expr.left) walkCond(expr.left);
-          if(expr.right) walkCond(expr.right);
-          if(expr.object) walkCond(expr.object);
-          if(expr.callee) walkCond(expr.callee);
-          if(expr.argument) walkCond(expr.argument);
-          if(expr.test) walkCond(expr.test);
-          if(expr.consequent) walkCond(expr.consequent);
-          if(expr.alternate) walkCond(expr.alternate);
-        };
-        walkCond(s.test);
+        this._walkExpr(s.test, condNodes);
 
         // Chain condition nodes
         let prev = c;
@@ -1880,26 +1977,9 @@ class CFGBuilder {
       case 'WhileStatement':case 'DoWhileStatement':{
         const lp=this._n(`${s.type}:${s.loc?.start?.line}`,s.type,s);
         const exitJ=this._n(`${s.type}_EXIT:${s.loc?.end?.line}`,'LOOP_EXIT',s);
-
-        // Extract CallExpressions from condition
+        // Extract ALL expressions from condition
         const condNodes = [];
-        const walkCond = (expr) => {
-          if(!expr) return;
-          if(expr.type === 'CallExpression') {
-            const cn = this._n(`LOOP_COND_CALL:${expr.loc?.start?.line}`, 'CallExpression', expr, {
-              callee_name: expr.callee?.name ?? expr.callee?.property?.name ?? '<expr>',
-              in_condition: true
-            });
-            condNodes.push(cn);
-            expr.arguments?.forEach(a => walkCond(a));
-          }
-          if(expr.left) walkCond(expr.left);
-          if(expr.right) walkCond(expr.right);
-          if(expr.argument) walkCond(expr.argument);
-        };
-        walkCond(s.test);
-
-        // Chain condition nodes to loop header
+        this._walkExpr(s.test, condNodes);
         let prev = lp;
         for(const cn of condNodes) {
           this._e(prev, cn, 'CFG', {condition_eval: true});
@@ -1996,27 +2076,9 @@ class CFGBuilder {
       }
       case 'SwitchStatement':{
         const sw=this._n(`SW:${s.loc?.start?.line}`,'SwitchStatement',s);
-
-        // Extract CallExpressions from discriminant
+        // Extract ALL expressions from discriminant
         const discNodes = [];
-        const walkDisc = (expr) => {
-          if(!expr) return;
-          if(expr.type === 'CallExpression') {
-            const cn = this._n(`SW_DISC_CALL:${expr.loc?.start?.line}`, 'CallExpression', expr, {
-              callee_name: expr.callee?.name ?? expr.callee?.property?.name ?? '<expr>',
-              in_switch_discriminant: true
-            });
-            discNodes.push(cn);
-            expr.arguments?.forEach(a => walkDisc(a));
-          }
-          if(expr.left) walkDisc(expr.left);
-          if(expr.right) walkDisc(expr.right);
-          if(expr.argument) walkDisc(expr.argument);
-          if(expr.object) walkDisc(expr.object);
-          if(expr.callee) walkDisc(expr.callee);
-        };
-        walkDisc(s.discriminant);
-
+        this._walkExpr(s.discriminant, discNodes);
         let prev = sw;
         for(const dn of discNodes) {
           this._e(prev, dn, 'CFG', {discriminant_eval: true});
@@ -2047,75 +2109,16 @@ class CFGBuilder {
       }
       case 'ExpressionStatement':{
         const n=this._n(`ES:${s.loc?.start?.line}`,s.type,s);
-
-        // Create sub-nodes for important expressions within the statement
         const exprNodes = [];
-        const walkExpr = (expr, parent) => {
-          if(!expr) return;
-          if(expr.type === 'CallExpression') {
-            const callNode = this._n(`CALL:${expr.loc?.start?.line}`, 'CallExpression', expr, {
-              callee_name: expr.callee?.name ?? expr.callee?.property?.name ?? '<expr>',
-              arg_count: expr.arguments?.length ?? 0,
-              can_throw: true
-            });
-            exprNodes.push(callNode);
-            expr.arguments?.forEach(a => walkExpr(a, expr));
-          } else if(expr.type === 'NewExpression') {
-            const newNode = this._n(`NEW:${expr.loc?.start?.line}`, 'NewExpression', expr, {
-              class_name: expr.callee?.name ?? '<expr>',
-              arg_count: expr.arguments?.length ?? 0,
-              constructor_call: true
-            });
-            exprNodes.push(newNode);
-            expr.arguments?.forEach(a => walkExpr(a, expr));  // Walk constructor arguments
-          } else if(expr.type === 'AwaitExpression') {
-            const awaitNode = this._n(`AWAIT:${expr.loc?.start?.line}`, 'AwaitExpression', expr, {
-              await_point: true
-            });
-            exprNodes.push(awaitNode);
-            walkExpr(expr.argument, expr);
-          } else if(expr.type === 'AssignmentExpression') {
-            const assignNode = this._n(`ASSIGN:${expr.loc?.start?.line}`, 'AssignmentExpression', expr, {
-              operator: expr.operator,
-              target: expr.left?.name ?? expr.left?.type
-            });
-            exprNodes.push(assignNode);
-            walkExpr(expr.right, expr);
-          } else if(expr.type === 'ConditionalExpression') {
-            // Ternary handled separately in _stmt
-          } else if(expr.type === 'LogicalExpression') {
-            // Short-circuit handled separately in _stmt
-          }
-          // Recurse into sub-expressions
-          if(expr.left) walkExpr(expr.left, expr);
-          if(expr.right) walkExpr(expr.right, expr);
-          if(expr.object) walkExpr(expr.object, expr);
-          if(expr.callee) walkExpr(expr.callee, expr);
-          if(expr.argument) walkExpr(expr.argument, expr);  // UnaryExpression, SpreadElement
-          if(expr.test) walkExpr(expr.test, expr);  // ConditionalExpression
-          if(expr.consequent) walkExpr(expr.consequent, expr);
-          if(expr.alternate) walkExpr(expr.alternate, expr);
-          if(expr.elements) expr.elements.forEach(e => walkExpr(e, expr));  // ArrayExpression
-          if(expr.properties) expr.properties.forEach(p => walkExpr(p.value ?? p.argument, expr));  // ObjectExpression
-          if(expr.expressions) expr.expressions.forEach(e => walkExpr(e, expr));  // SequenceExpression
-        };
-        walkExpr(s.expression, s);
-
-        // Chain expression nodes to statement node
+        this._walkExpr(s.expression, exprNodes);
         let prev = n;
         for(const en of exprNodes) {
           this._e(prev, en, 'CFG', {expression_flow: true});
           prev = en;
         }
-
-        // Check for await
         const hasAwait = ctx.isAsync && exprNodes.some(en => this.nodes.find(x => x.id === en)?.type === 'AwaitExpression');
         if(hasAwait) {
-          this._e(prev, prev, 'CFG', {
-            edge_label: 'await_suspend',
-            await_point: true,
-            can_throw: true
-          });
+          this._e(prev, prev, 'CFG', {edge_label: 'await_suspend', await_point: true, can_throw: true});
         }
         return{node:n,next:[prev]};
       }
@@ -2251,48 +2254,9 @@ class CFGBuilder {
       case 'VariableDeclaration': {
         const n = this._n(`VAR:${s.loc?.start?.line}`, s.type, s, {var_kind: s.kind});
         const exprNodes = [];
-
-        const walkExpr = (expr) => {
-          if(!expr) return;
-          if(expr.type === 'CallExpression') {
-            const callNode = this._n(`CALL:${expr.loc?.start?.line}`, 'CallExpression', expr, {
-              callee_name: expr.callee?.name ?? expr.callee?.property?.name ?? '<expr>',
-              arg_count: expr.arguments?.length ?? 0,
-              can_throw: true
-            });
-            exprNodes.push(callNode);
-            expr.arguments?.forEach(a => walkExpr(a));
-          } else if(expr.type === 'NewExpression') {
-            const newNode = this._n(`NEW:${expr.loc?.start?.line}`, 'NewExpression', expr, {
-              class_name: expr.callee?.name ?? '<expr>',
-              arg_count: expr.arguments?.length ?? 0,
-              constructor_call: true
-            });
-            exprNodes.push(newNode);
-            expr.arguments?.forEach(a => walkExpr(a));
-          } else if(expr.type === 'AwaitExpression') {
-            const awaitNode = this._n(`AWAIT:${expr.loc?.start?.line}`, 'AwaitExpression', expr);
-            exprNodes.push(awaitNode);
-            walkExpr(expr.argument);
-          }
-          // Recurse into sub-expressions
-          if(expr.left) walkExpr(expr.left);
-          if(expr.right) walkExpr(expr.right);
-          if(expr.object) walkExpr(expr.object);
-          if(expr.callee) walkExpr(expr.callee);
-          if(expr.argument) walkExpr(expr.argument);  // UnaryExpression, SpreadElement
-          if(expr.test) walkExpr(expr.test);  // ConditionalExpression
-          if(expr.consequent) walkExpr(expr.consequent);  // ConditionalExpression
-          if(expr.alternate) walkExpr(expr.alternate);  // ConditionalExpression
-          if(expr.elements) expr.elements.forEach(e => walkExpr(e));  // ArrayExpression
-          if(expr.properties) expr.properties.forEach(p => walkExpr(p.value ?? p.argument));  // ObjectExpression
-          if(expr.expressions) expr.expressions.forEach(e => walkExpr(e));  // SequenceExpression
-        };
-
         for(const decl of s.declarations ?? []) {
-          if(decl.init) walkExpr(decl.init);
+          if(decl.init) this._walkExpr(decl.init, exprNodes);
         }
-
         let prev = n;
         for(const en of exprNodes) {
           this._e(prev, en, 'CFG', {expression_flow: true});
@@ -2304,57 +2268,15 @@ class CFGBuilder {
       // ReturnStatement - extract expression sub-nodes from argument
       case 'ReturnStatement': {
         const n = this._n(`RET:${s.loc?.start?.line}`, 'ReturnStatement', s, {
-          has_value: !!s.argument,
-          value_type: s.argument?.type
+          has_value: !!s.argument, value_type: s.argument?.type
         });
         const exprNodes = [];
-
-        const walkExpr = (expr) => {
-          if(!expr) return;
-          if(expr.type === 'CallExpression') {
-            const callNode = this._n(`CALL:${expr.loc?.start?.line}`, 'CallExpression', expr, {
-              callee_name: expr.callee?.name ?? expr.callee?.property?.name ?? '<expr>',
-              arg_count: expr.arguments?.length ?? 0,
-              can_throw: true
-            });
-            exprNodes.push(callNode);
-            expr.arguments?.forEach(a => walkExpr(a));
-          } else if(expr.type === 'NewExpression') {
-            const newNode = this._n(`NEW:${expr.loc?.start?.line}`, 'NewExpression', expr, {
-              class_name: expr.callee?.name ?? '<expr>',
-              arg_count: expr.arguments?.length ?? 0,
-              constructor_call: true
-            });
-            exprNodes.push(newNode);
-            expr.arguments?.forEach(a => walkExpr(a));
-          } else if(expr.type === 'AwaitExpression') {
-            const awaitNode = this._n(`AWAIT:${expr.loc?.start?.line}`, 'AwaitExpression', expr);
-            exprNodes.push(awaitNode);
-            walkExpr(expr.argument);
-          }
-          // Recurse into sub-expressions
-          if(expr.left) walkExpr(expr.left);
-          if(expr.right) walkExpr(expr.right);
-          if(expr.object) walkExpr(expr.object);
-          if(expr.callee) walkExpr(expr.callee);
-          if(expr.argument) walkExpr(expr.argument);
-          if(expr.test) walkExpr(expr.test);
-          if(expr.consequent) walkExpr(expr.consequent);
-          if(expr.alternate) walkExpr(expr.alternate);
-          if(expr.elements) expr.elements.forEach(e => walkExpr(e));
-          if(expr.properties) expr.properties.forEach(p => walkExpr(p.value ?? p.argument));
-          if(expr.expressions) expr.expressions.forEach(e => walkExpr(e));
-        };
-
-        if(s.argument) walkExpr(s.argument);
-
+        if(s.argument) this._walkExpr(s.argument, exprNodes);
         let prev = n;
         for(const en of exprNodes) {
           this._e(prev, en, 'CFG', {expression_flow: true});
           prev = en;
         }
-
-        // Connect return to function exit
         this._e(prev, ctx.fe, 'CFG', {edge_label: 'return'});
         return {node: n, next: []};
       }
