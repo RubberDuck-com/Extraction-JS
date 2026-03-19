@@ -317,6 +317,9 @@ def run_bridge(repo_path: Path, timeout=BRIDGE_TIMEOUT) -> Optional[dict]:
             # fix #5: interprocedural_cfg on own line
             elif tp == "interprocedural_cfg":
                 acc["interprocedural_cfg"] = {"nodes":obj.get("nodes",[]),"edges":obj.get("edges",[])}
+            # interprocedural_ddg - cross-file data flow
+            elif tp == "interprocedural_ddg":
+                acc["interprocedural_ddg"] = {"nodes":obj.get("nodes",[]),"edges":obj.get("edges",[])}
             # fix #15: ts_types on own line
             elif tp == "ts_types":
                 acc["ts_types"] = obj.get("types",{})
@@ -455,6 +458,8 @@ def parse_raw(data: dict) -> dict:
     cg   = data.get("call_graph",          {"nodes":[],"edges":[]})
     # fix #5: use dedicated interprocedural_cfg line
     icfg = data.get("interprocedural_cfg", {"nodes":[],"edges":[]})
+    # interprocedural_ddg - cross-file data flow
+    xddg = data.get("interprocedural_ddg", {"nodes":[],"edges":[]})
     ucpg = data.get("unified_cpg",         {"nodes":[],"edges":[]})
     ifdg_r = data.get("ifdg",             {"files":[],"edges":[]})
 
@@ -474,6 +479,7 @@ def parse_raw(data: dict) -> dict:
         "per_file":          per_file,
         "call_graph":        to_g(cg["nodes"],   cg["edges"]),
         "icfg":              to_g(icfg["nodes"],  icfg["edges"]),
+        "xddg":              to_g(xddg["nodes"],  xddg["edges"]),  # interprocedural DDG
         "unified_cpg":       to_g(ucpg["nodes"],  ucpg["edges"]),
         "ifdg":              ifdg,
         "icfg_count":        data.get("icfg_count",          0),
