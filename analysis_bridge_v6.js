@@ -1816,6 +1816,8 @@ class CFGBuilder {
           callee_name: expr.callee?.name ?? expr.callee?.property?.name ?? '<expr>',
           arg_count: expr.arguments?.length ?? 0, can_throw: true
         }));
+        // Walk callee expression (Joern-style)
+        this._walkExpr(expr.callee, exprNodes);
         expr.arguments?.forEach(a => this._walkExpr(a, exprNodes));
         break;
       case 'NewExpression':
@@ -1823,6 +1825,8 @@ class CFGBuilder {
           class_name: expr.callee?.name ?? '<expr>',
           arg_count: expr.arguments?.length ?? 0, constructor_call: true
         }));
+        // Walk callee expression (Joern-style)
+        this._walkExpr(expr.callee, exprNodes);
         expr.arguments?.forEach(a => this._walkExpr(a, exprNodes));
         break;
       case 'AwaitExpression':
@@ -1894,11 +1898,45 @@ class CFGBuilder {
         exprNodes.push(this._n(`OBJ:${expr.loc?.start?.line}`, 'ObjectExpression', expr, {
           property_count: expr.properties?.length ?? 0
         }));
-        expr.properties?.forEach(p => this._walkExpr(p.value ?? p.argument, exprNodes));
+        for(const p of (expr.properties ?? [])) {
+          if(p.type === 'SpreadElement') {
+            this._walkExpr(p.argument, exprNodes);
+          } else {
+            // Add ObjectProperty node (Joern-style)
+            exprNodes.push(this._n(`OBJPROP:${p.loc?.start?.line}`, 'ObjectProperty', p, {
+              key_name: p.key?.name ?? p.key?.value ?? '<computed>',
+              shorthand: p.shorthand,
+              computed: p.computed,
+              method: p.method
+            }));
+            // Add property key node (Joern-style)
+            if(p.key) {
+              if(p.key.type === 'Identifier') {
+                exprNodes.push(this._n(`PROP_KEY:${p.loc?.start?.line}:${p.key.name}`, 'PropertyKey', p.key, {
+                  name: p.key.name, computed: p.computed, method: p.method
+                }));
+              } else if(p.computed) {
+                this._walkExpr(p.key, exprNodes);
+              }
+            }
+            // Add property value
+            if(p.value && !p.shorthand) this._walkExpr(p.value, exprNodes);
+          }
+        }
         break;
       case 'FunctionExpression': case 'ArrowFunctionExpression':
         exprNodes.push(this._n(`FN:${expr.loc?.start?.line}`, expr.type, expr, {
           is_async: expr.async, is_generator: expr.generator, param_count: expr.params?.length ?? 0
+        }));
+        // Add parameter nodes for inline functions (Joern-style)
+        for(let i = 0; i < (expr.params ?? []).length; i++) {
+          this._walkPattern(expr.params[i], exprNodes, i);
+        }
+        break;
+      case 'ClassExpression':
+        exprNodes.push(this._n(`CLASS_EXPR:${expr.loc?.start?.line}`, 'ClassExpression', expr, {
+          class_name: expr.id?.name ?? '<anonymous>',
+          has_superclass: !!expr.superClass
         }));
         break;
       case 'SequenceExpression':
@@ -1921,19 +1959,111 @@ class CFGBuilder {
         exprNodes.push(this._n(`YIELD:${expr.loc?.start?.line}`, 'YieldExpression', expr, {delegate: expr.delegate}));
         if(expr.argument) this._walkExpr(expr.argument, exprNodes);
         break;
+      case 'OptionalCallExpression':
+        exprNodes.push(this._n(`OPT_CALL:${expr.loc?.start?.line}`, 'OptionalCallExpression', expr, {
+          callee_name: expr.callee?.name ?? expr.callee?.property?.name ?? '<expr>',
+          arg_count: expr.arguments?.length ?? 0, optional: true
+        }));
+        this._walkExpr(expr.callee, exprNodes);
+        expr.arguments?.forEach(a => this._walkExpr(a, exprNodes));
+        break;
+      case 'OptionalMemberExpression':
+        exprNodes.push(this._n(`OPT_MEM:${expr.loc?.start?.line}`, 'OptionalMemberExpression', expr, {
+          property: expr.property?.name ?? expr.property?.value ?? '<computed>',
+          computed: expr.computed, optional: expr.optional
+        }));
+        this._walkExpr(expr.object, exprNodes);
+        if(expr.computed) this._walkExpr(expr.property, exprNodes);
+        break;
+      case 'Super':
+        exprNodes.push(this._n(`SUPER:${expr.loc?.start?.line}`, 'Super', expr));
+        break;
+      case 'MetaProperty':
+        exprNodes.push(this._n(`META:${expr.loc?.start?.line}`, 'MetaProperty', expr, {
+          meta: expr.meta?.name, property: expr.property?.name
+        }));
+        break;
+      case 'Import':
+        exprNodes.push(this._n(`DYN_IMPORT:${expr.loc?.start?.line}`, 'Import', expr));
+        break;
     }
   }
 
   buildFunc(fn,name,isAsync=false,isGen=false){
     const entry=this._n(`ENTRY:${name}`,'ENTRY',fn);
     const exit =this._n(`EXIT:${name}`, 'EXIT', fn);
-    if(!fn.body){this._e(entry,exit);return{entry,exit};}
+
+    // Add CFG nodes for function parameters (Joern-style structural identifiers)
+    let lastParamNode = entry;
+    for(let i = 0; i < (fn.params ?? []).length; i++) {
+      const param = fn.params[i];
+      const paramNodes = [];
+      this._walkPattern(param, paramNodes, i);
+      for(const pn of paramNodes) {
+        this._e(lastParamNode, pn, 'CFG', {param_flow: true});
+        lastParamNode = pn;
+      }
+    }
+
+    if(!fn.body){this._e(lastParamNode,exit);return{entry,exit};}
     const stmts=fn.body.type==='BlockStatement'?fn.body.body:[fn.body];
     const ctx={fe:exit,isAsync,isGen,bk:[],ct:[]};
-    const{firstNode:fN,exits}=this._block(stmts,[entry],ctx);
-    if(fN!==null)this._e(entry,fN);
+    const{firstNode:fN,exits}=this._block(stmts,[lastParamNode],ctx);
+    if(fN!==null)this._e(lastParamNode,fN);
     exits.forEach(n=>this._e(n,exit));
     return{entry,exit};
+  }
+
+  // Walk destructuring patterns and create CFG nodes for each binding
+  _walkPattern(pat, nodes, paramIndex = -1) {
+    if(!pat) return;
+    switch(pat.type) {
+      case 'Identifier':
+        nodes.push(this._n(`PARAM:${pat.loc?.start?.line}:${pat.name}`, 'Parameter', pat, {
+          name: pat.name, param_index: paramIndex
+        }));
+        break;
+      case 'AssignmentPattern':
+        // param = default
+        this._walkPattern(pat.left, nodes, paramIndex);
+        nodes.push(this._n(`DEFAULT:${pat.loc?.start?.line}`, 'DefaultValue', pat, {
+          has_default: true, param_index: paramIndex
+        }));
+        this._walkExpr(pat.right, nodes);
+        break;
+      case 'RestElement':
+        nodes.push(this._n(`REST:${pat.loc?.start?.line}`, 'RestElement', pat, {
+          name: pat.argument?.name, param_index: paramIndex, is_rest: true
+        }));
+        break;
+      case 'ArrayPattern':
+        nodes.push(this._n(`DESTRUCT_ARR:${pat.loc?.start?.line}`, 'ArrayPattern', pat, {
+          element_count: pat.elements?.length ?? 0, param_index: paramIndex
+        }));
+        for(let i = 0; i < (pat.elements ?? []).length; i++) {
+          const el = pat.elements[i];
+          if(el) this._walkPattern(el, nodes, paramIndex);
+        }
+        break;
+      case 'ObjectPattern':
+        nodes.push(this._n(`DESTRUCT_OBJ:${pat.loc?.start?.line}`, 'ObjectPattern', pat, {
+          property_count: pat.properties?.length ?? 0, param_index: paramIndex
+        }));
+        for(const prop of (pat.properties ?? [])) {
+          if(prop.type === 'RestElement') {
+            this._walkPattern(prop, nodes, paramIndex);
+          } else {
+            // ObjectProperty in pattern
+            if(prop.key?.name && prop.key !== prop.value) {
+              nodes.push(this._n(`PROP_KEY:${prop.loc?.start?.line}:${prop.key.name}`, 'PropertyKey', prop.key, {
+                name: prop.key.name, shorthand: prop.shorthand
+              }));
+            }
+            this._walkPattern(prop.value, nodes, paramIndex);
+          }
+        }
+        break;
+    }
   }
   _block(ss,preds,ctx){
     if(!ss?.length)return{firstNode:null,exits:preds};
@@ -2250,11 +2380,19 @@ class CFGBuilder {
         return {node: ap, next: [apj]};
       }
 
-      // VariableDeclaration - extract expression sub-nodes from initializers
+      // VariableDeclaration - extract variable names and initializers (Joern-style)
       case 'VariableDeclaration': {
         const n = this._n(`VAR:${s.loc?.start?.line}`, s.type, s, {var_kind: s.kind});
         const exprNodes = [];
         for(const decl of s.declarations ?? []) {
+          // Add VariableDeclarator node (Joern-style)
+          exprNodes.push(this._n(`DECL:${decl.loc?.start?.line}`, 'VariableDeclarator', decl, {
+            name: decl.id?.name ?? decl.id?.type,
+            has_init: !!decl.init
+          }));
+          // Add variable name/pattern node (Joern-style structural identifier)
+          this._walkPattern(decl.id, exprNodes);
+          // Add initializer expression nodes
           if(decl.init) this._walkExpr(decl.init, exprNodes);
         }
         let prev = n;
@@ -2304,10 +2442,21 @@ class CFGBuilder {
                 method_kind: member.kind,  // 'constructor', 'method', 'get', 'set'
                 is_static: member.static,
                 is_async: member.async,
-                is_generator: member.generator
+                is_generator: member.generator,
+                param_count: member.params?.length ?? 0
               });
               prev.forEach(p => this._e(p, mn, 'CFG', {class_member: true}));
-              prev = [mn];
+              // Add parameter nodes for method (Joern-style)
+              const paramNodes = [];
+              for(let i = 0; i < (member.params ?? []).length; i++) {
+                this._walkPattern(member.params[i], paramNodes, i);
+              }
+              let lastNode = mn;
+              for(const pn of paramNodes) {
+                this._e(lastNode, pn, 'CFG', {method_param: true});
+                lastNode = pn;
+              }
+              prev = [lastNode];
             } else if (member.type === 'StaticBlock') {
               const sb = this._n(`STATIC_BLOCK:${member.loc?.start?.line}`, 'StaticBlock', member);
               prev.forEach(p => this._e(p, sb, 'CFG', {class_member: true, static_block: true}));
@@ -2319,11 +2468,128 @@ class CFGBuilder {
                 has_initializer: !!member.value
               });
               prev.forEach(p => this._e(p, cp, 'CFG', {class_member: true, class_field: true}));
-              prev = [cp];
+              // Add initializer expression nodes if present
+              if(member.value) {
+                const initNodes = [];
+                this._walkExpr(member.value, initNodes);
+                let lastNode = cp;
+                for(const en of initNodes) {
+                  this._e(lastNode, en, 'CFG', {field_init: true});
+                  lastNode = en;
+                }
+                prev = [lastNode];
+              } else {
+                prev = [cp];
+              }
             }
           }
         }
         return {node: cn, next: [cn]};
+      }
+
+      // ImportDeclaration - add specifier nodes (Joern-style)
+      case 'ImportDeclaration': {
+        const n = this._n(`IMPORT:${s.loc?.start?.line}`, 'ImportDeclaration', s, {
+          source: s.source?.value,
+          specifier_count: s.specifiers?.length ?? 0
+        });
+        const specNodes = [];
+        for(const spec of (s.specifiers ?? [])) {
+          if(spec.type === 'ImportDefaultSpecifier') {
+            specNodes.push(this._n(`IMPORT_DEFAULT:${spec.loc?.start?.line}:${spec.local?.name}`, 'ImportDefault', spec, {
+              local: spec.local?.name
+            }));
+          } else if(spec.type === 'ImportNamespaceSpecifier') {
+            specNodes.push(this._n(`IMPORT_NS:${spec.loc?.start?.line}:${spec.local?.name}`, 'ImportNamespace', spec, {
+              local: spec.local?.name
+            }));
+          } else if(spec.type === 'ImportSpecifier') {
+            specNodes.push(this._n(`IMPORT_SPEC:${spec.loc?.start?.line}:${spec.local?.name}`, 'ImportSpecifier', spec, {
+              local: spec.local?.name,
+              imported: spec.imported?.name
+            }));
+          }
+        }
+        let prev = n;
+        for(const sn of specNodes) {
+          this._e(prev, sn, 'CFG', {import_binding: true});
+          prev = sn;
+        }
+        return {node: n, next: [prev]};
+      }
+
+      // ExportNamedDeclaration - add export specifiers
+      case 'ExportNamedDeclaration': {
+        const n = this._n(`EXPORT:${s.loc?.start?.line}`, 'ExportNamedDeclaration', s, {
+          source: s.source?.value,
+          specifier_count: s.specifiers?.length ?? 0
+        });
+        const specNodes = [];
+        for(const spec of (s.specifiers ?? [])) {
+          specNodes.push(this._n(`EXPORT_SPEC:${spec.loc?.start?.line}:${spec.exported?.name}`, 'ExportSpecifier', spec, {
+            local: spec.local?.name,
+            exported: spec.exported?.name
+          }));
+        }
+        let prev = n;
+        for(const sn of specNodes) {
+          this._e(prev, sn, 'CFG', {export_binding: true});
+          prev = sn;
+        }
+        // If there's a declaration, process it
+        if(s.declaration) {
+          const declResult = this._stmt(s.declaration, ctx);
+          if(declResult) {
+            this._e(prev, declResult.node, 'CFG', {export_decl: true});
+            return {node: n, next: declResult.next};
+          }
+        }
+        return {node: n, next: [prev]};
+      }
+
+      // ExportDefaultDeclaration
+      case 'ExportDefaultDeclaration': {
+        const n = this._n(`EXPORT_DEFAULT:${s.loc?.start?.line}`, 'ExportDefaultDeclaration', s);
+        if(s.declaration) {
+          const exprNodes = [];
+          this._walkExpr(s.declaration, exprNodes);
+          let prev = n;
+          for(const en of exprNodes) {
+            this._e(prev, en, 'CFG', {export_value: true});
+            prev = en;
+          }
+          return {node: n, next: [prev]};
+        }
+        return {node: n, next: [n]};
+      }
+
+      // ExportAllDeclaration - export * from 'module'
+      case 'ExportAllDeclaration': {
+        const n = this._n(`EXPORT_ALL:${s.loc?.start?.line}`, 'ExportAllDeclaration', s, {
+          source: s.source?.value,
+          exported: s.exported?.name
+        });
+        return {node: n, next: [n]};
+      }
+
+      // FunctionDeclaration - add parameter nodes (Joern-style)
+      case 'FunctionDeclaration': {
+        const n = this._n(`FUNC:${s.loc?.start?.line}`, 'FunctionDeclaration', s, {
+          name: s.id?.name ?? '<anonymous>',
+          is_async: s.async,
+          is_generator: s.generator,
+          param_count: s.params?.length ?? 0
+        });
+        const paramNodes = [];
+        for(let i = 0; i < (s.params ?? []).length; i++) {
+          this._walkPattern(s.params[i], paramNodes, i);
+        }
+        let prev = n;
+        for(const pn of paramNodes) {
+          this._e(prev, pn, 'CFG', {func_param: true});
+          prev = pn;
+        }
+        return {node: n, next: [prev]};
       }
 
       default:{const n=this._n(`${s.type}:${s.loc?.start?.line}`,s.type,s);return{node:n,next:[n]};}
