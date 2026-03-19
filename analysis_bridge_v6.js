@@ -75,6 +75,64 @@ const JS_KW = new Set([
   'clearInterval','parseInt','parseFloat','isNaN','isFinite',
 ]);
 
+// Phase 2: Built-in function registry for tracking external/built-in calls
+const JS_BUILTINS = new Set([
+  // Console
+  'console', 'console.log', 'console.error', 'console.warn', 'console.info', 'console.debug',
+  // JSON
+  'JSON', 'JSON.parse', 'JSON.stringify',
+  // Timers
+  'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval', 'setImmediate', 'clearImmediate',
+  // Object
+  'Object', 'Object.keys', 'Object.values', 'Object.entries', 'Object.assign', 'Object.create',
+  'Object.defineProperty', 'Object.defineProperties', 'Object.freeze', 'Object.seal',
+  'Object.getOwnPropertyNames', 'Object.getOwnPropertyDescriptor', 'Object.getPrototypeOf',
+  // Array
+  'Array', 'Array.isArray', 'Array.from', 'Array.of',
+  // Promise
+  'Promise', 'Promise.all', 'Promise.allSettled', 'Promise.any', 'Promise.race',
+  'Promise.resolve', 'Promise.reject',
+  // Math
+  'Math', 'Math.floor', 'Math.ceil', 'Math.round', 'Math.abs', 'Math.min', 'Math.max',
+  'Math.random', 'Math.pow', 'Math.sqrt', 'Math.log', 'Math.sin', 'Math.cos',
+  // String
+  'String', 'String.fromCharCode', 'String.fromCodePoint',
+  // Number
+  'Number', 'Number.isNaN', 'Number.isFinite', 'Number.isInteger', 'Number.parseFloat', 'Number.parseInt',
+  // Boolean/Primitives
+  'Boolean', 'Symbol', 'BigInt',
+  // Collections
+  'Map', 'Set', 'WeakMap', 'WeakSet',
+  // Error
+  'Error', 'TypeError', 'ReferenceError', 'SyntaxError', 'RangeError',
+  // Typed Arrays
+  'ArrayBuffer', 'DataView', 'Int8Array', 'Uint8Array', 'Int16Array', 'Uint16Array',
+  'Int32Array', 'Uint32Array', 'Float32Array', 'Float64Array',
+  // Parsing
+  'parseInt', 'parseFloat', 'isNaN', 'isFinite', 'encodeURI', 'decodeURI',
+  'encodeURIComponent', 'decodeURIComponent', 'eval',
+  // Node.js core
+  'require', 'process', 'Buffer', 'global', '__dirname', '__filename',
+  // Reflect/Proxy
+  'Reflect', 'Proxy',
+  // Regex
+  'RegExp',
+  // Date
+  'Date', 'Date.now', 'Date.parse', 'Date.UTC',
+]);
+
+// Common array methods that take callbacks
+const ARRAY_CALLBACK_METHODS = new Set([
+  'map', 'filter', 'forEach', 'reduce', 'reduceRight', 'find', 'findIndex',
+  'some', 'every', 'flatMap', 'sort'
+]);
+
+// Promise handler methods
+const PROMISE_HANDLER_METHODS = new Set(['then', 'catch', 'finally']);
+
+// Event handler methods
+const EVENT_HANDLER_METHODS = new Set(['on', 'once', 'addEventListener', 'addListener', 'removeListener', 'off']);
+
 // fix #17: consistent normalisation
 const norm = p => (p != null ? String(p).replace(/\\/g, '/') : '');
 const loc  = n => ({
@@ -149,38 +207,241 @@ function collectFiles(rootDir) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 2.  Parse
+// 2.  Parse (with comment extraction)
 // ─────────────────────────────────────────────────────────────
 function parseFile(code, fp) {
   const isTS = /\.(ts|tsx|d\.ts)$/.test(fp);
+  const comments = [];
   return parser.parse(code, {
-    sourceType:'unambiguous', errorRecovery:true,
+    sourceType:'unambiguous',
+    errorRecovery:true,
+    attachComment: true,  // Attach comments to AST nodes
     plugins: isTS
       ? ['typescript','jsx','classProperties','decorators-legacy','optionalChaining','nullishCoalescingOperator','topLevelAwait']
       : ['jsx','classProperties','optionalChaining','nullishCoalescingOperator','topLevelAwait'],
   });
 }
 
+// Literal type classification
+const LITERAL_TYPES = new Set([
+  'StringLiteral', 'NumericLiteral', 'BooleanLiteral', 'NullLiteral',
+  'RegExpLiteral', 'BigIntLiteral', 'TemplateLiteral', 'TemplateElement'
+]);
+
+// Operator expressions
+const OPERATOR_EXPRESSIONS = new Set([
+  'BinaryExpression', 'UnaryExpression', 'UpdateExpression', 'LogicalExpression',
+  'AssignmentExpression', 'ConditionalExpression'
+]);
+
+// Get literal value safely
+function getLiteralValue(node) {
+  if (!node) return null;
+  switch(node.type) {
+    case 'StringLiteral': return { type: 'string', value: node.value, raw: node.extra?.raw };
+    case 'NumericLiteral': return { type: 'number', value: node.value, raw: node.extra?.raw };
+    case 'BooleanLiteral': return { type: 'boolean', value: node.value };
+    case 'NullLiteral': return { type: 'null', value: null };
+    case 'BigIntLiteral': return { type: 'bigint', value: node.value, raw: node.extra?.raw };
+    case 'RegExpLiteral': return { type: 'regex', pattern: node.pattern, flags: node.flags };
+    case 'TemplateLiteral': return { type: 'template', quasis: node.quasis?.length ?? 0, expressions: node.expressions?.length ?? 0 };
+    case 'TemplateElement': return { type: 'template_element', value: node.value?.cooked, raw: node.value?.raw, tail: node.tail };
+    case 'Literal': // Fallback for some parsers
+      if (typeof node.value === 'string') return { type: 'string', value: node.value };
+      if (typeof node.value === 'number') return { type: 'number', value: node.value };
+      if (typeof node.value === 'boolean') return { type: 'boolean', value: node.value };
+      if (node.value === null) return { type: 'null', value: null };
+      if (node.regex) return { type: 'regex', pattern: node.regex.pattern, flags: node.regex.flags };
+      return { type: 'unknown', value: node.value };
+    default: return null;
+  }
+}
+
+// Get operator info
+function getOperatorInfo(node) {
+  if (!node) return null;
+  switch(node.type) {
+    case 'BinaryExpression': return { category: 'binary', operator: node.operator };
+    case 'UnaryExpression': return { category: 'unary', operator: node.operator, prefix: node.prefix };
+    case 'UpdateExpression': return { category: 'update', operator: node.operator, prefix: node.prefix };
+    case 'LogicalExpression': return { category: 'logical', operator: node.operator };
+    case 'AssignmentExpression': return { category: 'assignment', operator: node.operator };
+    case 'ConditionalExpression': return { category: 'ternary', operator: '?:' };
+    default: return null;
+  }
+}
+
 // ─────────────────────────────────────────────────────────────
-// 3.  AST builder
+// 3.  AST builder (with literals, operators, and comments)
 // ─────────────────────────────────────────────────────────────
 function buildAST(ast, rel) {
   const nodes=[], edges=[], nodeIdMap=new WeakMap();
-  const SKIP=new Set(['type','loc','start','end','tokens','comments','errors']);
+  const comments = [];
+  const SKIP=new Set(['type','loc','start','end','tokens','errors','leadingComments','trailingComments','innerComments']);
+
   function walk(node, pid) {
     if (!node||typeof node!=='object'||!node.type) return;
     const id=nid(); nodeIdMap.set(node,id);
-    nodes.push({id,label:node.type,type:node.type,full_label:node.type,...loc(node),file:rel,full_path:rel});
+
+    // Base node properties
+    const nodeData = {
+      id,
+      label: node.type,
+      type: node.type,
+      full_label: node.type,
+      ...loc(node),
+      file: rel,
+      full_path: rel
+    };
+
+    // Extract literal values
+    const litVal = getLiteralValue(node);
+    if (litVal) {
+      nodeData.literal_type = litVal.type;
+      nodeData.literal_value = litVal.value;
+      if (litVal.raw) nodeData.literal_raw = litVal.raw;
+      if (litVal.pattern) nodeData.regex_pattern = litVal.pattern;
+      if (litVal.flags) nodeData.regex_flags = litVal.flags;
+    }
+
+    // Extract operator info
+    const opInfo = getOperatorInfo(node);
+    if (opInfo) {
+      nodeData.operator = opInfo.operator;
+      nodeData.operator_category = opInfo.category;
+      if (opInfo.prefix !== undefined) nodeData.operator_prefix = opInfo.prefix;
+    }
+
+    // Extract identifier names
+    if (node.type === 'Identifier') {
+      nodeData.name = node.name;
+    }
+
+    // Extract member expression info
+    if (node.type === 'MemberExpression' || node.type === 'OptionalMemberExpression') {
+      nodeData.computed = node.computed;
+      nodeData.optional = node.optional ?? false;
+      if (node.property?.name) nodeData.property_name = node.property.name;
+    }
+
+    // Extract call expression info
+    if (node.type === 'CallExpression' || node.type === 'OptionalCallExpression' || node.type === 'NewExpression') {
+      nodeData.argument_count = (node.arguments ?? []).length;
+      nodeData.is_new = node.type === 'NewExpression';
+      nodeData.optional = node.optional ?? false;
+      // Extract callee name if simple
+      if (node.callee?.name) nodeData.callee_name = node.callee.name;
+      else if (node.callee?.property?.name) nodeData.callee_method = node.callee.property.name;
+    }
+
+    // Extract function info
+    if (node.type === 'FunctionDeclaration' || node.type === 'FunctionExpression' || node.type === 'ArrowFunctionExpression') {
+      nodeData.is_async = node.async ?? false;
+      nodeData.is_generator = node.generator ?? false;
+      nodeData.param_count = (node.params ?? []).length;
+      if (node.id?.name) nodeData.function_name = node.id.name;
+    }
+
+    // Extract class info
+    if (node.type === 'ClassDeclaration' || node.type === 'ClassExpression') {
+      if (node.id?.name) nodeData.class_name = node.id.name;
+      if (node.superClass?.name) nodeData.super_class = node.superClass.name;
+    }
+
+    // Extract class method/property info
+    if (node.type === 'ClassMethod' || node.type === 'ClassPrivateMethod') {
+      nodeData.method_kind = node.kind; // 'constructor', 'method', 'get', 'set'
+      nodeData.is_static = node.static ?? false;
+      nodeData.is_async = node.async ?? false;
+      nodeData.is_generator = node.generator ?? false;
+      if (node.key?.name) nodeData.method_name = node.key.name;
+      else if (node.key?.id?.name) nodeData.method_name = '#' + node.key.id.name;
+    }
+
+    if (node.type === 'ClassProperty' || node.type === 'ClassPrivateProperty') {
+      nodeData.is_static = node.static ?? false;
+      if (node.key?.name) nodeData.property_name = node.key.name;
+      else if (node.key?.id?.name) nodeData.property_name = '#' + node.key.id.name;
+    }
+
+    // Extract variable declaration kind
+    if (node.type === 'VariableDeclaration') {
+      nodeData.var_kind = node.kind; // 'var', 'let', 'const'
+    }
+
+    // Extract import/export info
+    if (node.type === 'ImportDeclaration') {
+      nodeData.import_source = node.source?.value;
+      nodeData.import_kind = node.importKind ?? 'value';
+    }
+    if (node.type === 'ExportNamedDeclaration' || node.type === 'ExportDefaultDeclaration') {
+      if (node.source?.value) nodeData.export_source = node.source.value;
+    }
+
+    // Extract control flow info
+    if (node.type === 'IfStatement' || node.type === 'ConditionalExpression') {
+      nodeData.has_alternate = node.alternate != null;
+    }
+    if (node.type === 'SwitchStatement') {
+      nodeData.case_count = (node.cases ?? []).length;
+    }
+    if (node.type === 'TryStatement') {
+      nodeData.has_catch = node.handler != null;
+      nodeData.has_finally = node.finalizer != null;
+    }
+
+    // Extract loop info
+    if (node.type === 'ForStatement' || node.type === 'WhileStatement' || node.type === 'DoWhileStatement') {
+      nodeData.loop_type = node.type.replace('Statement', '').toLowerCase();
+    }
+    if (node.type === 'ForInStatement' || node.type === 'ForOfStatement') {
+      nodeData.loop_type = node.type.replace('Statement', '').toLowerCase();
+      nodeData.is_await = node.await ?? false;
+    }
+
+    // Extract comments attached to this node
+    const nodeComments = [];
+    for (const c of node.leadingComments ?? []) {
+      nodeComments.push({ position: 'leading', type: c.type, value: c.value, line: c.loc?.start?.line });
+    }
+    for (const c of node.trailingComments ?? []) {
+      nodeComments.push({ position: 'trailing', type: c.type, value: c.value, line: c.loc?.start?.line });
+    }
+    for (const c of node.innerComments ?? []) {
+      nodeComments.push({ position: 'inner', type: c.type, value: c.value, line: c.loc?.start?.line });
+    }
+    if (nodeComments.length > 0) {
+      nodeData.comments = nodeComments;
+      nodeData.has_jsdoc = nodeComments.some(c => c.type === 'CommentBlock' && c.value.startsWith('*'));
+    }
+
+    nodes.push(nodeData);
     if (pid!==null) edges.push({src:pid,dst:id,edge_type:'AST',source_line:nodes[nodes.length-2]?.line??-1,target_line:nodes[nodes.length-1]?.line??-1});
+
     for (const k of Object.keys(node)) {
-      if (SKIP.has(k)) continue;
+      if (SKIP.has(k) || k === 'comments') continue;
       const v=node[k];
       if (Array.isArray(v)) v.forEach(c=>walk(c,id));
       else if (v&&typeof v==='object'&&v.type) walk(v,id);
     }
   }
+
   walk(ast.program,null);
-  return {nodes,edges,nodeIdMap};
+
+  // Extract standalone comments from ast.comments if available
+  for (const c of ast.comments ?? []) {
+    comments.push({
+      id: nid(),
+      type: 'COMMENT',
+      comment_type: c.type, // 'CommentLine' or 'CommentBlock'
+      value: c.value,
+      ...loc(c),
+      file: rel,
+      is_jsdoc: c.type === 'CommentBlock' && c.value.startsWith('*')
+    });
+  }
+
+  return {nodes, edges, nodeIdMap, comments};
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -203,13 +464,24 @@ class ScopeWalker {
     this.scopes=[]; this.defs=[]; this.uses=[];
     this._evalPolluted=false;
 
-    // NEW: Enhanced semantic tracking
+    // Enhanced semantic tracking
     this.propWrites=[];      // obj.prop = value
     this.propReads=[];       // x = obj.prop
     this.destructures=[];    // {a,b} = obj mappings
     this.closureCaptures=[]; // vars captured from outer scope
     this.exceptions=[];      // throw/catch connections
     this.conditionals=[];    // && || ?: tracking
+
+    // NEW: Literal and operator tracking for complete DDG
+    this.literals=[];        // All literal values in code
+    this.operators=[];       // All operators with operands
+    this.spreadOps=[];       // Spread operations
+    this.arrayAccess=[];     // Array element access
+    this.functionReturns=[]; // Return statements with values
+    this.functionParams=[];  // Function parameters
+    this.callArgs=[];        // Arguments passed to function calls
+    this.awaitExprs=[];      // Await expressions
+    this.yieldExprs=[];      // Yield expressions
   }
   push(kind) {
     this.scopes.push({
@@ -531,6 +803,231 @@ class ScopeWalker {
         }
         // Continue with normal handling
         if(node.init) this.walk(node.init);
+        return;
+
+      // ====== NEW: Literal Value Tracking ======
+      case 'StringLiteral': case 'NumericLiteral': case 'BooleanLiteral':
+      case 'NullLiteral': case 'BigIntLiteral': case 'RegExpLiteral':
+        this.literals.push({
+          type: node.type.replace('Literal', '').toLowerCase(),
+          value: node.value ?? node.pattern,
+          raw: node.extra?.raw ?? node.raw,
+          pattern: node.pattern,
+          flags: node.flags,
+          line,
+          ref: node
+        });
+        return;
+
+      case 'TemplateLiteral':
+        this.literals.push({
+          type: 'template',
+          quasis: node.quasis?.length ?? 0,
+          expressions: node.expressions?.length ?? 0,
+          line,
+          ref: node
+        });
+        // Walk expressions inside template
+        node.expressions?.forEach(e => this.walk(e));
+        return;
+
+      // ====== NEW: Operator Tracking ======
+      case 'BinaryExpression':
+        this.operators.push({
+          category: 'binary',
+          operator: node.operator,
+          leftRef: node.left,
+          rightRef: node.right,
+          line,
+          ref: node
+        });
+        this.walk(node.left);
+        this.walk(node.right);
+        return;
+
+      case 'UnaryExpression':
+        this.operators.push({
+          category: 'unary',
+          operator: node.operator,
+          prefix: node.prefix,
+          argumentRef: node.argument,
+          line,
+          ref: node
+        });
+        this.walk(node.argument);
+        return;
+
+      case 'UpdateExpression':
+        this.operators.push({
+          category: 'update',
+          operator: node.operator,
+          prefix: node.prefix,
+          argumentRef: node.argument,
+          line,
+          ref: node
+        });
+        // UpdateExpression also causes a use and def
+        if (node.argument?.name) {
+          this.use(node.argument.name, node.argument, line);
+        }
+        this.walk(node.argument);
+        return;
+
+      // ====== NEW: Spread Operator Tracking ======
+      case 'SpreadElement':
+        this.spreadOps.push({
+          kind: 'spread',
+          argumentRef: node.argument,
+          line,
+          ref: node
+        });
+        this.walk(node.argument);
+        return;
+
+      case 'RestElement':
+        this.spreadOps.push({
+          kind: 'rest',
+          argumentRef: node.argument,
+          line,
+          ref: node
+        });
+        this.flatDef(node.argument, 'var');
+        return;
+
+      // ====== NEW: Array Element Access Tracking ======
+      case 'MemberExpression': case 'OptionalMemberExpression':
+        if(node.object) this.walk(node.object);
+        // Track non-computed property reads (obj.prop, not obj[expr])
+        if (!node.computed && node.property?.name) {
+          const objName = node.object?.name ?? (node.object?.type === 'ThisExpression' ? 'this' : '<expr>');
+          this.propReads.push({
+            objName,
+            propName: node.property.name,
+            optional: node.optional ?? false,
+            line,
+            ref: node
+          });
+        }
+        // Track computed/array access
+        if (node.computed) {
+          const objName = node.object?.name ?? '<expr>';
+          const indexExpr = node.property?.type === 'NumericLiteral' ? node.property.value :
+                           node.property?.type === 'StringLiteral' ? node.property.value :
+                           node.property?.name ?? '<expr>';
+          this.arrayAccess.push({
+            objName,
+            indexExpr,
+            line,
+            ref: node
+          });
+          this.walk(node.property);
+        }
+        return;
+
+      // ====== NEW: Return Statement Tracking ======
+      case 'ReturnStatement':
+        this.functionReturns.push({
+          hasValue: node.argument != null,
+          valueRef: node.argument,
+          line,
+          ref: node
+        });
+        if(node.argument) this.walk(node.argument);
+        return;
+
+      // ====== NEW: Await/Yield Tracking ======
+      case 'AwaitExpression':
+        this.awaitExprs.push({
+          argumentRef: node.argument,
+          line,
+          ref: node
+        });
+        if(node.argument) this.walk(node.argument);
+        return;
+
+      case 'YieldExpression':
+        this.yieldExprs.push({
+          delegate: node.delegate ?? false,
+          argumentRef: node.argument,
+          line,
+          ref: node
+        });
+        if(node.argument) this.walk(node.argument);
+        return;
+
+      // ====== NEW: Call Expression Argument Tracking ======
+      case 'CallExpression': case 'OptionalCallExpression': case 'NewExpression':
+        // Track arguments for data flow
+        const calleeName = node.callee?.name ?? node.callee?.property?.name ?? '<expr>';
+        for(let i = 0; i < (node.arguments ?? []).length; i++) {
+          const arg = node.arguments[i];
+          this.callArgs.push({
+            callee: calleeName,
+            argIndex: i,
+            argRef: arg,
+            isSpread: arg?.type === 'SpreadElement',
+            line,
+            ref: node
+          });
+        }
+        // Walk callee and arguments
+        if(node.callee) this.walk(node.callee);
+        node.arguments?.forEach(a => this.walk(a));
+        return;
+
+      // ====== NEW: Function Parameter Tracking ======
+      case 'FunctionDeclaration': case 'FunctionExpression': {
+        if(node.id?.name) this.def(node.id.name,'var',node.id,line);
+        // Track parameters with defaults
+        for(let i = 0; i < (node.params ?? []).length; i++) {
+          const p = node.params[i];
+          this.functionParams.push({
+            funcName: node.id?.name ?? '<anon>',
+            paramIndex: i,
+            paramRef: p,
+            hasDefault: p?.type === 'AssignmentPattern',
+            isRest: p?.type === 'RestElement',
+            isDestructured: p?.type === 'ObjectPattern' || p?.type === 'ArrayPattern',
+            line: p?.loc?.start?.line ?? line,
+            ref: p
+          });
+        }
+        this.push('function');
+        this.hoistVars(node.body);
+        node.params?.forEach(p=>this.flatDef(p,'var'));
+        if(node.body) { this._checkEval(node.body); this.walk(node.body); }
+        this.pop(); return;
+      }
+
+      case 'ArrowFunctionExpression': {
+        // Track parameters with defaults for arrows too
+        for(let i = 0; i < (node.params ?? []).length; i++) {
+          const p = node.params[i];
+          this.functionParams.push({
+            funcName: '<arrow>',
+            paramIndex: i,
+            paramRef: p,
+            hasDefault: p?.type === 'AssignmentPattern',
+            isRest: p?.type === 'RestElement',
+            isDestructured: p?.type === 'ObjectPattern' || p?.type === 'ArrayPattern',
+            line: p?.loc?.start?.line ?? line,
+            ref: p
+          });
+        }
+        this.push('arrow');
+        node.params?.forEach(p=>this.flatDef(p,'var'));
+        if(node.body) this.walk(node.body);
+        this.pop(); return;
+      }
+
+      // ====== NEW: Super Call/Access Tracking ======
+      case 'Super':
+        this.use('super', node, line);
+        return;
+
+      // ====== NEW: This Expression Tracking ======
+      case 'ThisExpression':
+        this.use('this', node, line);
         return;
 
       default:
@@ -890,6 +1387,251 @@ class ScopeWalker {
       }
     }
 
+    // ====== NEW: LITERAL nodes ======
+    const literalNodes = new Map(); // `${type}:${line}` -> nodeId
+    for(const lit of this.literals) {
+      const id = nid();
+      const astId = this.nm.get(lit.ref) ?? -1;
+      const valueStr = lit.type === 'regex' ? `/${lit.pattern}/${lit.flags ?? ''}` :
+                       lit.type === 'template' ? '`...`' :
+                       String(lit.value ?? '').slice(0, 50);
+      nodes.push({
+        id,
+        label: valueStr,
+        type: 'LITERAL',
+        full_label: `${lit.type}: ${valueStr}`,
+        literal_type: lit.type,
+        literal_value: lit.value,
+        literal_raw: lit.raw,
+        regex_pattern: lit.pattern,
+        regex_flags: lit.flags,
+        line: lit.line,
+        end_line: lit.line,
+        file: this.rel,
+        full_path: this.rel,
+        ast_ref: astId
+      });
+      literalNodes.set(`${lit.type}:${lit.line}:${astId}`, id);
+    }
+
+    // ====== NEW: OPERATOR nodes ======
+    const operatorNodes = new Map();
+    for(const op of this.operators) {
+      const id = nid();
+      const astId = this.nm.get(op.ref) ?? -1;
+      nodes.push({
+        id,
+        label: op.operator,
+        type: 'OPERATOR',
+        full_label: `${op.category} ${op.operator}`,
+        operator: op.operator,
+        operator_category: op.category,
+        operator_prefix: op.prefix,
+        line: op.line,
+        end_line: op.line,
+        file: this.rel,
+        full_path: this.rel,
+        ast_ref: astId
+      });
+      operatorNodes.set(`${op.operator}:${op.line}:${astId}`, id);
+
+      // Create OPERAND edges from operands to operator
+      // For binary: left -> op, right -> op
+      if(op.leftRef) {
+        const leftAstId = this.nm.get(op.leftRef);
+        if(leftAstId != null) {
+          edges.push({
+            src: leftAstId,
+            dst: id,
+            edge_type: 'OPERAND',
+            operand_position: 'left',
+            operator: op.operator
+          });
+        }
+      }
+      if(op.rightRef) {
+        const rightAstId = this.nm.get(op.rightRef);
+        if(rightAstId != null) {
+          edges.push({
+            src: rightAstId,
+            dst: id,
+            edge_type: 'OPERAND',
+            operand_position: 'right',
+            operator: op.operator
+          });
+        }
+      }
+      if(op.argumentRef) {
+        const argAstId = this.nm.get(op.argumentRef);
+        if(argAstId != null) {
+          edges.push({
+            src: argAstId,
+            dst: id,
+            edge_type: 'OPERAND',
+            operand_position: 'argument',
+            operator: op.operator
+          });
+        }
+      }
+    }
+
+    // ====== NEW: SPREAD nodes ======
+    for(const sp of this.spreadOps) {
+      const id = nid();
+      const astId = this.nm.get(sp.ref) ?? -1;
+      nodes.push({
+        id,
+        label: sp.kind === 'spread' ? '...' : '...rest',
+        type: sp.kind === 'spread' ? 'SPREAD' : 'REST',
+        full_label: sp.kind === 'spread' ? 'spread' : 'rest parameter',
+        spread_kind: sp.kind,
+        line: sp.line,
+        end_line: sp.line,
+        file: this.rel,
+        full_path: this.rel,
+        ast_ref: astId
+      });
+    }
+
+    // ====== NEW: ARRAY_ACCESS nodes ======
+    for(const aa of this.arrayAccess) {
+      const id = nid();
+      const astId = this.nm.get(aa.ref) ?? -1;
+      nodes.push({
+        id,
+        label: `${aa.objName}[${aa.indexExpr}]`,
+        type: 'ARRAY_ACCESS',
+        full_label: `${aa.objName}[${aa.indexExpr}]`,
+        object_name: aa.objName,
+        index_expr: aa.indexExpr,
+        line: aa.line,
+        end_line: aa.line,
+        file: this.rel,
+        full_path: this.rel,
+        ast_ref: astId
+      });
+    }
+
+    // ====== NEW: RETURN nodes ======
+    for(const ret of this.functionReturns) {
+      const id = nid();
+      const astId = this.nm.get(ret.ref) ?? -1;
+      nodes.push({
+        id,
+        label: ret.hasValue ? 'return value' : 'return',
+        type: 'RETURN',
+        full_label: ret.hasValue ? 'return <value>' : 'return',
+        has_value: ret.hasValue,
+        line: ret.line,
+        end_line: ret.line,
+        file: this.rel,
+        full_path: this.rel,
+        ast_ref: astId
+      });
+      // Create edge from return value to return node
+      if(ret.valueRef) {
+        const valAstId = this.nm.get(ret.valueRef);
+        if(valAstId != null) {
+          edges.push({
+            src: valAstId,
+            dst: id,
+            edge_type: 'RETURN_VALUE',
+            line: ret.line
+          });
+        }
+      }
+    }
+
+    // ====== NEW: AWAIT nodes ======
+    for(const aw of this.awaitExprs) {
+      const id = nid();
+      const astId = this.nm.get(aw.ref) ?? -1;
+      nodes.push({
+        id,
+        label: 'await',
+        type: 'AWAIT',
+        full_label: 'await expression',
+        line: aw.line,
+        end_line: aw.line,
+        file: this.rel,
+        full_path: this.rel,
+        ast_ref: astId
+      });
+    }
+
+    // ====== NEW: YIELD nodes ======
+    for(const yd of this.yieldExprs) {
+      const id = nid();
+      const astId = this.nm.get(yd.ref) ?? -1;
+      nodes.push({
+        id,
+        label: yd.delegate ? 'yield*' : 'yield',
+        type: 'YIELD',
+        full_label: yd.delegate ? 'yield delegate' : 'yield',
+        is_delegate: yd.delegate,
+        line: yd.line,
+        end_line: yd.line,
+        file: this.rel,
+        full_path: this.rel,
+        ast_ref: astId
+      });
+    }
+
+    // ====== NEW: CALL_ARG nodes for argument data flow ======
+    for(const ca of this.callArgs) {
+      const id = nid();
+      const astId = this.nm.get(ca.ref) ?? -1;
+      nodes.push({
+        id,
+        label: `arg${ca.argIndex}`,
+        type: 'CALL_ARG',
+        full_label: `${ca.callee}(arg${ca.argIndex})`,
+        callee_name: ca.callee,
+        arg_index: ca.argIndex,
+        is_spread: ca.isSpread,
+        line: ca.line,
+        end_line: ca.line,
+        file: this.rel,
+        full_path: this.rel,
+        ast_ref: astId
+      });
+      // Edge from argument value to call arg node
+      if(ca.argRef) {
+        const argAstId = this.nm.get(ca.argRef);
+        if(argAstId != null) {
+          edges.push({
+            src: argAstId,
+            dst: id,
+            edge_type: 'ARG_VALUE',
+            arg_index: ca.argIndex,
+            callee: ca.callee
+          });
+        }
+      }
+    }
+
+    // ====== NEW: PARAM nodes for function parameters ======
+    for(const fp of this.functionParams) {
+      const id = nid();
+      const astId = this.nm.get(fp.ref) ?? -1;
+      nodes.push({
+        id,
+        label: `param${fp.paramIndex}`,
+        type: 'PARAM',
+        full_label: `${fp.funcName}(param${fp.paramIndex})`,
+        func_name: fp.funcName,
+        param_index: fp.paramIndex,
+        has_default: fp.hasDefault,
+        is_rest: fp.isRest,
+        is_destructured: fp.isDestructured,
+        line: fp.line,
+        end_line: fp.line,
+        file: this.rel,
+        full_path: this.rel,
+        ast_ref: astId
+      });
+    }
+
     return {nodes, edges};
   }
 
@@ -1222,21 +1964,69 @@ class CFGBuilder {
 function extractFunctions(ast, rel) {
   const out=[];
   const FT=new Set(['FunctionDeclaration','FunctionExpression','ArrowFunctionExpression']);
-  function name(node,parent){
-    if(node.id?.name)return node.id.name;
-    if(parent?.type==='VariableDeclarator')return parent.id?.name??'<anon>';
-    if(parent?.type==='AssignmentExpression')return parent.left?.name??'<anon>';
-    if(parent?.type==='ObjectProperty'||parent?.type==='Property')return parent.key?.name??parent.key?.value??'<anon>';
-    if(parent?.type==='ClassMethod')return parent.key?.name??'<anon>';
-    if(parent?.type==='ExportDefaultDeclaration')return 'default';
-    return`<anon:${node.loc?.start?.line??'?'}>`;
+
+  // Phase 1.2: Enhanced naming for anonymous functions
+  function name(node, parent, grandparent) {
+    if(node.id?.name) return node.id.name;
+    if(parent?.type==='VariableDeclarator') return parent.id?.name??'<anon>';
+    if(parent?.type==='AssignmentExpression') return parent.left?.name??'<anon>';
+    if(parent?.type==='ObjectProperty'||parent?.type==='Property') return parent.key?.name??parent.key?.value??'<anon>';
+    if(parent?.type==='ClassMethod') return parent.key?.name??'<anon>';
+    if(parent?.type==='ExportDefaultDeclaration') return 'default';
+
+    const line = node.loc?.start?.line ?? '?';
+
+    // NEW: Array method callbacks (map, filter, forEach, etc.)
+    if(parent?.type === 'CallExpression') {
+      const methodName = parent.callee?.property?.name;
+      if(ARRAY_CALLBACK_METHODS.has(methodName)) {
+        // Determine which argument position this function is in
+        const argIndex = (parent.arguments ?? []).indexOf(node);
+        return `${methodName}$callback${argIndex > 0 ? argIndex : ''}:${line}`;
+      }
+    }
+
+    // NEW: Promise handlers (.then, .catch, .finally)
+    if(parent?.type === 'CallExpression') {
+      const methodName = parent.callee?.property?.name;
+      if(PROMISE_HANDLER_METHODS.has(methodName)) {
+        const argIndex = (parent.arguments ?? []).indexOf(node);
+        return `${methodName}$handler${argIndex > 0 ? argIndex : ''}:${line}`;
+      }
+    }
+
+    // NEW: Event handlers (.on, .addEventListener, etc.)
+    if(parent?.type === 'CallExpression') {
+      const methodName = parent.callee?.property?.name;
+      if(EVENT_HANDLER_METHODS.has(methodName)) {
+        const eventName = parent.arguments?.[0]?.value ?? 'event';
+        return `on$${eventName}:${line}`;
+      }
+    }
+
+    // NEW: Callback argument to known function
+    if(parent?.type === 'CallExpression') {
+      const calleeName = parent.callee?.name ?? parent.callee?.property?.name;
+      if(calleeName) {
+        const argIndex = (parent.arguments ?? []).indexOf(node);
+        return `${calleeName}$cb${argIndex}:${line}`;
+      }
+    }
+
+    return `<anon:${line}>`;
   }
-  function walk(node,parent){
-    if(!node||typeof node!=='object')return;
-    if(FT.has(node.type))out.push({node,name:name(node,parent),file:rel,isAsync:node.async??false,isGen:node.generator??false});
-    for(const k of Object.keys(node)){if(['loc','start','end','tokens','comments'].includes(k))continue;const v=node[k];if(Array.isArray(v))v.forEach(c=>walk(c,node));else if(v?.type)walk(v,node);}
+
+  function walk(node, parent, grandparent) {
+    if(!node||typeof node!=='object') return;
+    if(FT.has(node.type)) out.push({node, name: name(node, parent, grandparent), file: rel, isAsync: node.async??false, isGen: node.generator??false});
+    for(const k of Object.keys(node)){
+      if(['loc','start','end','tokens','comments'].includes(k)) continue;
+      const v=node[k];
+      if(Array.isArray(v)) v.forEach(c => walk(c, node, parent));
+      else if(v?.type) walk(v, node, parent);
+    }
   }
-  walk(ast.program,null);
+  walk(ast.program, null, null);
   return out;
 }
 
@@ -1376,6 +2166,8 @@ class ModResolver {
   constructor(rootDir,fps,wsA,tscA,fileExports){
     this.root=rootDir;this.fps=new Set(fps);this.wsA=wsA??new Map();this.tscA=tscA??new Map();this.fe=fileExports??new Map();
     this.m2f=new Map();this.al=new Map();this._idx(fps);
+    // Phase 4: Track external dependencies (npm packages)
+    this.externalDeps=new Map();  // file -> Set of external package names
   }
   _idx(fps){
     for(const fp of fps){
@@ -1405,27 +2197,101 @@ class ModResolver {
   }
   extractImports(fromFile,ast){
     const al=new Map();const self=this;
+    // Phase 4: Track external dependencies for this file
+    if(!self.externalDeps.has(fromFile)) self.externalDeps.set(fromFile, new Set());
+    const fileDeps = self.externalDeps.get(fromFile);
+
+    // Helper to extract package name from import specifier
+    function getPackageName(spec) {
+      if(!spec || spec.startsWith('.') || spec.startsWith('/')) return null;
+      // Handle scoped packages: @org/package -> @org/package
+      // Handle regular packages: express -> express, lodash/get -> lodash
+      if(spec.startsWith('@')) {
+        const parts = spec.split('/');
+        return parts.length >= 2 ? `${parts[0]}/${parts[1]}` : spec;
+      }
+      return spec.split('/')[0];
+    }
+
     function walk(n){
       if(!n||typeof n!=='object')return;
       if(n.type==='ImportDeclaration'){
-        const r=self.resSpec(fromFile,n.source?.value??'')??n.source?.value;
+        const specVal = n.source?.value ?? '';
+        const r=self.resSpec(fromFile,specVal);
+
+        // Phase 4: Track external dependencies (non-relative imports that don't resolve to local files)
+        if(!specVal.startsWith('.') && !r) {
+          const pkgName = getPackageName(specVal);
+          if(pkgName) {
+            fileDeps.add(pkgName);
+            // Store with EXTERNAL prefix for tracking
+            for(const s of n.specifiers??[]){
+              if(s.type==='ImportDefaultSpecifier') al.set(s.local.name, `EXTERNAL:${pkgName}`);
+              else if(s.type==='ImportNamespaceSpecifier') al.set(s.local.name, `EXTERNAL:${pkgName}`);
+              else if(s.type==='ImportSpecifier') {
+                const imp = s.imported?.name ?? s.imported?.value;
+                al.set(s.local.name, `EXTERNAL:${pkgName}::${imp}`);
+              }
+            }
+            return;
+          }
+        }
+
+        const resolved = r ?? specVal;
         for(const s of n.specifiers??[]){
-          if(s.type==='ImportDefaultSpecifier')al.set(s.local.name,r);
-          else if(s.type==='ImportNamespaceSpecifier')al.set(s.local.name,r);
-          else if(s.type==='ImportSpecifier'){const imp=s.imported?.name??s.imported?.value;const expInfo=self.fe.get(r)?.get(imp);al.set(s.local.name,expInfo?`${r}::${expInfo.sourceName??imp}`:`${r}::${imp}`);}
+          if(s.type==='ImportDefaultSpecifier')al.set(s.local.name,resolved);
+          else if(s.type==='ImportNamespaceSpecifier')al.set(s.local.name,resolved);
+          else if(s.type==='ImportSpecifier'){const imp=s.imported?.name??s.imported?.value;const expInfo=self.fe.get(resolved)?.get(imp);al.set(s.local.name,expInfo?`${resolved}::${expInfo.sourceName??imp}`:`${resolved}::${imp}`);}
         }
         return;
       }
       if(n.type==='VariableDeclaration')for(const d of n.declarations??[]){
         if(d.init?.type!=='CallExpression'||d.init.callee?.name!=='require')continue;
         const spec=d.init.arguments?.[0]?.value;if(!spec)continue;
-        const r=self.resSpec(fromFile,spec)??spec;
-        if(d.id?.type==='Identifier')al.set(d.id.name,r);
-        else if(d.id?.type==='ObjectPattern')for(const p of d.id.properties??[]){const k=p.value?.name??p.key?.name;if(k){const ei=self.fe.get(r)?.get(k);al.set(k,ei?`${r}::${ei.sourceName??k}`:`${r}::${k}`);}}
+        const r=self.resSpec(fromFile,spec);
+
+        // Phase 4: Track external require() calls
+        if(!spec.startsWith('.') && !r) {
+          const pkgName = getPackageName(spec);
+          if(pkgName) {
+            fileDeps.add(pkgName);
+            if(d.id?.type==='Identifier') al.set(d.id.name, `EXTERNAL:${pkgName}`);
+            else if(d.id?.type==='ObjectPattern') {
+              for(const p of d.id.properties??[]) {
+                const k = p.value?.name ?? p.key?.name;
+                if(k) al.set(k, `EXTERNAL:${pkgName}::${k}`);
+              }
+            }
+            continue;
+          }
+        }
+
+        const resolved = r ?? spec;
+        if(d.id?.type==='Identifier')al.set(d.id.name,resolved);
+        else if(d.id?.type==='ObjectPattern')for(const p of d.id.properties??[]){const k=p.value?.name??p.key?.name;if(k){const ei=self.fe.get(resolved)?.get(k);al.set(k,ei?`${resolved}::${ei.sourceName??k}`:`${resolved}::${k}`);}}
       }
       // re-exports
-      if(n.type==='ExportNamedDeclaration'&&n.source){const r=self.resSpec(fromFile,n.source.value??'')??n.source.value;for(const s of n.specifiers??[]){const local=s.local?.name??s.local?.value,exp=s.exported?.name??s.exported?.value;if(local)al.set(local,`${r}::${local}`);if(exp&&exp!==local)al.set(exp,`${r}::${local??exp}`);}}
-      if(n.type==='ExportAllDeclaration'&&n.source){const r=self.resSpec(fromFile,n.source.value??'')??n.source.value;if(r)al.set(`*:${r}`,r);}
+      if(n.type==='ExportNamedDeclaration'&&n.source){
+        const specVal = n.source.value ?? '';
+        const r=self.resSpec(fromFile,specVal);
+        // Track external re-exports
+        if(!specVal.startsWith('.') && !r) {
+          const pkgName = getPackageName(specVal);
+          if(pkgName) fileDeps.add(pkgName);
+        }
+        const resolved = r ?? specVal;
+        for(const s of n.specifiers??[]){const local=s.local?.name??s.local?.value,exp=s.exported?.name??s.exported?.value;if(local)al.set(local,`${resolved}::${local}`);if(exp&&exp!==local)al.set(exp,`${resolved}::${local??exp}`);}
+      }
+      if(n.type==='ExportAllDeclaration'&&n.source){
+        const specVal = n.source.value ?? '';
+        const r=self.resSpec(fromFile,specVal);
+        if(!specVal.startsWith('.') && !r) {
+          const pkgName = getPackageName(specVal);
+          if(pkgName) fileDeps.add(pkgName);
+        }
+        const resolved = r ?? specVal;
+        if(resolved)al.set(`*:${resolved}`,resolved);
+      }
       for(const v of Object.values(n)){if(Array.isArray(v))v.forEach(walk);else if(v?.type)walk(v);}
     }
     walk(ast.program);
@@ -1438,25 +2304,105 @@ class ModResolver {
     for(const[fp,al]of this.al){const seen=new Set();for(const tgt of al.values()){const b=tgt.split('::')[0];if(this.fps.has(b)&&b!==fp&&!seen.has(b)){seen.add(b);edges.push({src:fp,dst:b,dependency_type:'import',call_count:1});}}}
     return edges;
   }
+
+  // Phase 4: Get all unique external packages
+  getExternalPackages(){
+    const pkgs = new Set();
+    for(const deps of this.externalDeps.values()) {
+      for(const pkg of deps) pkgs.add(pkg);
+    }
+    return [...pkgs];
+  }
+
+  // Phase 4: Get external import edges
+  externalImportEdges(){
+    const edges = [];
+    for(const[fp, deps] of this.externalDeps) {
+      for(const pkg of deps) {
+        edges.push({src: fp, dst: `npm:${pkg}`, dependency_type: 'external_import', call_count: 1});
+      }
+    }
+    return edges;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────
 // 11.  Repo analyzer  (fix #6 getMRO visited, fix for circular)
 // ─────────────────────────────────────────────────────────────
 class RepoAnalyzer {
-  constructor(resolver,proto,typeProp,atm){this.res=resolver;this.pt=proto;this.tp=typeProp;this.atm=atm;this.fns=new Map();this.calls=new Map();this.classes=new Map();}
+  constructor(resolver,proto,typeProp,atm){
+    this.res=resolver;this.pt=proto;this.tp=typeProp;this.atm=atm;
+    this.fns=new Map();this.calls=new Map();this.classes=new Map();
+    // Phase 2: Track external/built-in calls
+    this.externalCalls=[];
+    // Phase 3: Track object creation sites for type inference
+    this.objectTypes=new Map();  // file -> Map(varName -> inferredType)
+    // Phase 1: Track callback references
+    this.callbackRefs=[];
+    // NEW: Track additional call types for complete call graph
+    this.constructorCalls=[];    // new Class() calls
+    this.superCalls=[];          // super() and super.method() calls
+    this.getterAccess=[];        // Property access that might be a getter
+    this.setterAccess=[];        // Property assignment that might be a setter
+    this.methodKinds=new Map();  // Track method kinds (constructor, getter, setter)
+  }
   extract(ast,rel){
     const self=this;
     const FT=new Set(['FunctionDeclaration','FunctionExpression','ArrowFunctionExpression']);
-    function gn(node,parent){
-      if(node.id?.name)return node.id.name;
-      if(parent?.type==='VariableDeclarator')return parent.id?.name??'<anon>';
-      if(parent?.type==='AssignmentExpression')return parent.left?.name??'<anon>';
-      if(parent?.type==='ObjectProperty'||parent?.type==='Property')return parent.key?.name??parent.key?.value??'<anon>';
-      if(parent?.type==='ClassMethod')return parent.key?.name??'<anon>';
-      if(parent?.type==='ExportDefaultDeclaration')return 'default';
-      return`<anon:${node.loc?.start?.line??'?'}>`;
+
+    // Phase 1.2: Enhanced naming for anonymous functions (same as extractFunctions)
+    function gn(node, parent) {
+      if(node.id?.name) return node.id.name;
+      if(parent?.type==='VariableDeclarator') return parent.id?.name??'<anon>';
+      if(parent?.type==='AssignmentExpression') return parent.left?.name??'<anon>';
+      if(parent?.type==='ObjectProperty'||parent?.type==='Property') return parent.key?.name??parent.key?.value??'<anon>';
+      if(parent?.type==='ClassMethod') return parent.key?.name??'<anon>';
+      if(parent?.type==='ExportDefaultDeclaration') return 'default';
+
+      const line = node.loc?.start?.line ?? '?';
+
+      // Array method callbacks
+      if(parent?.type === 'CallExpression') {
+        const methodName = parent.callee?.property?.name;
+        if(ARRAY_CALLBACK_METHODS.has(methodName)) {
+          const argIndex = (parent.arguments ?? []).indexOf(node);
+          return `${methodName}$callback${argIndex > 0 ? argIndex : ''}:${line}`;
+        }
+      }
+
+      // Promise handlers
+      if(parent?.type === 'CallExpression') {
+        const methodName = parent.callee?.property?.name;
+        if(PROMISE_HANDLER_METHODS.has(methodName)) {
+          const argIndex = (parent.arguments ?? []).indexOf(node);
+          return `${methodName}$handler${argIndex > 0 ? argIndex : ''}:${line}`;
+        }
+      }
+
+      // Event handlers
+      if(parent?.type === 'CallExpression') {
+        const methodName = parent.callee?.property?.name;
+        if(EVENT_HANDLER_METHODS.has(methodName)) {
+          const eventName = parent.arguments?.[0]?.value ?? 'event';
+          return `on$${eventName}:${line}`;
+        }
+      }
+
+      // Callback argument to known function
+      if(parent?.type === 'CallExpression') {
+        const calleeName = parent.callee?.name ?? parent.callee?.property?.name;
+        if(calleeName) {
+          const argIndex = (parent.arguments ?? []).indexOf(node);
+          return `${calleeName}$cb${argIndex}:${line}`;
+        }
+      }
+
+      return `<anon:${line}>`;
     }
+    // Initialize per-file object types map
+    if(!self.objectTypes.has(rel)) self.objectTypes.set(rel, new Map());
+    const fileObjTypes = self.objectTypes.get(rel);
+
     function walk(n,parent,cls){
       if(!n||typeof n!=='object')return;
       if(n.type==='ClassDeclaration'||n.type==='ClassExpression'){
@@ -1465,6 +2411,26 @@ class RepoAnalyzer {
         if(n.superClass){if(n.superClass.type==='Identifier')bases.push(n.superClass.name);else if(n.superClass.type==='MemberExpression')bases.push(`${n.superClass.object?.name}.${n.superClass.property?.name}`);}
         self.classes.set(cn,{file:rel,bases,methods:[...self.pt.methods(cn)],line:n.loc?.start?.line??-1,injectable:false});
       }
+
+      // Phase 3: Track object creation sites for type inference
+      if(n.type==='VariableDeclarator' && n.id?.type==='Identifier') {
+        const varName = n.id.name;
+        // Track: const app = express() → app has type 'express'
+        if(n.init?.type === 'CallExpression') {
+          const callee = n.init.callee;
+          if(callee?.type === 'Identifier') {
+            fileObjTypes.set(varName, callee.name);
+          } else if(callee?.type === 'MemberExpression' && callee.property?.name) {
+            fileObjTypes.set(varName, callee.property.name);
+          }
+        }
+        // Track: const router = new Router() → router has type 'Router'
+        if(n.init?.type === 'NewExpression') {
+          const ctorName = n.init.callee?.name ?? n.init.callee?.property?.name;
+          if(ctorName) fileObjTypes.set(varName, ctorName);
+        }
+      }
+
       if(FT.has(n.type)){
         const fname=gn(n,parent);
         const params=(n.params??[]).flatMap(p=>flattenPat(p)).filter(p=>p!=='this');
@@ -1472,18 +2438,202 @@ class RepoAnalyzer {
         if(!self.fns.has(fname))self.fns.set(fname,[]);self.fns.get(fname).push(rec);
         if(cls){const qn=`${cls}.${fname}`;if(!self.fns.has(qn))self.fns.set(qn,[]);self.fns.get(qn).push(rec);}
       }
+
       if(n.type==='CallExpression'||n.type==='OptionalCallExpression'){
         const nA=(n.arguments??[]).length,line=n.loc?.start?.line??-1;
         let callee=null;const c=n.callee;
-        if(c?.type==='Identifier'){callee=c.name;}
+        let isResolved = false;
+
+        if(c?.type==='Identifier'){
+          callee=c.name;
+          // Phase 2: Track if this is an external/built-in call
+          if(JS_BUILTINS.has(callee)) {
+            self.externalCalls.push({
+              kind: 'builtin',
+              callee,
+              file: rel,
+              line,
+              module: callee.split('.')[0]
+            });
+            isResolved = true;
+          }
+        }
         else if(c?.type==='MemberExpression'||c?.type==='OptionalMemberExpression'){
           const prop=c.property?.name??'?';
-          if(c.object?.type==='ThisExpression'){const tc=self.atm.get(rel)?.get(`${rel}:${line}`)??cls;callee=tc?`${tc}.${prop}`:`this.${prop}`;}
-          else{const obj=c.object?.name??c.object?.property?.name??'?';callee=c.computed?`${obj}[<dyn>]`:self.tp?.resolveMethod(rel,obj,prop)??`${obj}.${prop}`;}
+          if(c.object?.type==='ThisExpression'){
+            const tc=self.atm.get(rel)?.get(`${rel}:${line}`)??cls;
+            callee=tc?`${tc}.${prop}`:`this.${prop}`;
+          }
+          else{
+            const obj=c.object?.name??c.object?.property?.name??'?';
+            if(c.computed) {
+              callee=`${obj}[<dyn>]`;
+            } else {
+              // Phase 3: Use inferred object type for method resolution
+              const inferredType = fileObjTypes.get(obj);
+              if(inferredType) {
+                callee = `${inferredType}.${prop}`;
+              } else {
+                callee = self.tp?.resolveMethod(rel,obj,prop) ?? `${obj}.${prop}`;
+              }
+            }
+          }
+          // Phase 2: Check for built-in method calls
+          const fullCallee = `${c.object?.name ?? ''}.${prop}`;
+          if(JS_BUILTINS.has(fullCallee) || JS_BUILTINS.has(c.object?.name ?? '')) {
+            self.externalCalls.push({
+              kind: 'builtin',
+              callee: fullCallee,
+              file: rel,
+              line,
+              module: c.object?.name ?? prop
+            });
+            isResolved = true;
+          }
         }
-        if(c?.type==='MemberExpression'&&['then','catch','finally'].includes(c.property?.name)){const cb=n.arguments?.[0];if(cb?.name){if(!self.calls.has(rel))self.calls.set(rel,[]);self.calls.get(rel).push({calledName:cb.name,nodeId:line,nArgs:0,line});}}
-        if(callee){if(!self.calls.has(rel))self.calls.set(rel,[]);self.calls.get(rel).push({calledName:callee,nodeId:line,nArgs:nA,line});}
+
+        // Phase 1: Track callback arguments
+        for(let i = 0; i < (n.arguments ?? []).length; i++) {
+          const arg = n.arguments[i];
+          if(arg?.type === 'Identifier') {
+            // This is a function reference passed as callback
+            self.callbackRefs.push({
+              callerFile: rel,
+              callerLine: line,
+              argIndex: i,
+              refName: arg.name,
+              calleeName: callee
+            });
+          }
+          if(arg?.type === 'FunctionExpression' || arg?.type === 'ArrowFunctionExpression') {
+            // Inline callback - create synthetic name link
+            const synthName = `${callee ?? 'fn'}$cb${i}:${line}`;
+            self.callbackRefs.push({
+              callerFile: rel,
+              callerLine: line,
+              argIndex: i,
+              refName: synthName,
+              calleeName: callee,
+              isInline: true
+            });
+          }
+        }
+
+        // Track promise/event handlers for call graph edges
+        if(c?.type==='MemberExpression'&&PROMISE_HANDLER_METHODS.has(c.property?.name)){
+          const cb=n.arguments?.[0];
+          if(cb?.name){
+            if(!self.calls.has(rel))self.calls.set(rel,[]);
+            self.calls.get(rel).push({calledName:cb.name,nodeId:line,nArgs:0,line,kind:'promise_handler',method:c.property.name});
+          }
+        }
+
+        if(c?.type==='MemberExpression'&&EVENT_HANDLER_METHODS.has(c.property?.name)){
+          const cb=n.arguments?.[1];
+          const eventName = n.arguments?.[0]?.value ?? '<dyn>';
+          if(cb?.name){
+            if(!self.calls.has(rel))self.calls.set(rel,[]);
+            self.calls.get(rel).push({calledName:cb.name,nodeId:line,nArgs:0,line,kind:'event_handler',event:eventName,object:c.object?.name});
+          }
+        }
+
+        if(callee){
+          if(!self.calls.has(rel))self.calls.set(rel,[]);
+          self.calls.get(rel).push({calledName:callee,nodeId:line,nArgs:nA,line});
+
+          // Phase 2: Track external calls (not built-in, not resolved internally)
+          if(!isResolved && !callee.startsWith('.') && !callee.includes('[<dyn>]')) {
+            const baseName = callee.split('.')[0];
+            // Check if this might be an external module call
+            const resolved = self.res?.resolve(rel, baseName);
+            if(resolved && resolved.startsWith && !resolved.startsWith('.') && !self.fns.has(callee)) {
+              const moduleName = resolved.split('::')[0];
+              if(!moduleName.endsWith('.js') && !moduleName.endsWith('.ts')) {
+                self.externalCalls.push({
+                  kind: 'external',
+                  callee,
+                  file: rel,
+                  line,
+                  module: moduleName
+                });
+              }
+            }
+          }
+        }
       }
+
+      // NEW: Track constructor calls (NewExpression)
+      if(n.type === 'NewExpression') {
+        const line = n.loc?.start?.line ?? -1;
+        const nA = (n.arguments ?? []).length;
+        let ctorName = n.callee?.name ?? n.callee?.property?.name ?? '<expr>';
+        if(n.callee?.type === 'MemberExpression') {
+          ctorName = `${n.callee.object?.name ?? '?'}.${n.callee.property?.name ?? '?'}`;
+        }
+        self.constructorCalls.push({
+          className: ctorName,
+          file: rel,
+          line,
+          nArgs: nA
+        });
+        // Also add to calls for resolution
+        if(!self.calls.has(rel)) self.calls.set(rel, []);
+        self.calls.get(rel).push({
+          calledName: ctorName,
+          nodeId: line,
+          nArgs: nA,
+          line,
+          kind: 'constructor'
+        });
+      }
+
+      // NEW: Track super calls
+      if(n.type === 'Super') {
+        const line = n.loc?.start?.line ?? -1;
+        // Check if parent is a CallExpression (super()) or MemberExpression (super.method())
+        if(parent?.type === 'CallExpression' && parent.callee === n) {
+          self.superCalls.push({
+            kind: 'super_constructor',
+            file: rel,
+            line,
+            cls
+          });
+          if(!self.calls.has(rel)) self.calls.set(rel, []);
+          self.calls.get(rel).push({
+            calledName: 'super',
+            nodeId: line,
+            nArgs: (parent.arguments ?? []).length,
+            line,
+            kind: 'super_constructor'
+          });
+        } else if(parent?.type === 'MemberExpression') {
+          const methodName = parent.property?.name;
+          self.superCalls.push({
+            kind: 'super_method',
+            method: methodName,
+            file: rel,
+            line,
+            cls
+          });
+        }
+      }
+
+      // NEW: Track class method kinds (constructor, getter, setter)
+      if(n.type === 'ClassMethod' || n.type === 'ClassPrivateMethod') {
+        const methodName = n.key?.name ?? n.key?.id?.name ?? '<anon>';
+        const line = n.loc?.start?.line ?? -1;
+        const key = `${cls ?? '?'}.${methodName}`;
+        self.methodKinds.set(key, {
+          kind: n.kind, // 'constructor', 'method', 'get', 'set'
+          isStatic: n.static ?? false,
+          isAsync: n.async ?? false,
+          isGenerator: n.generator ?? false,
+          file: rel,
+          line,
+          cls
+        });
+      }
+
       for(const k of Object.keys(n)){if(['loc','start','end','tokens','comments'].includes(k))continue;const v=n[k];if(Array.isArray(v))v.forEach(c=>walk(c,n,cls));else if(v?.type)walk(v,n,cls);}
     }
     walk(ast.program,null,null);
@@ -1505,6 +2655,25 @@ class RepoAnalyzer {
     let cands=[...(this.fns.get(name)??[])];
     if(name.includes('.')&&!name.includes('[<dyn>]')){
       const[obj,...rest]=name.split('.');const meth=rest.join('.');
+
+      // Phase 3: Check inferred object type first
+      const fileObjTypes = this.objectTypes.get(cf);
+      const objType = fileObjTypes?.get(obj);
+      if(objType) {
+        // Try resolving as objType.method
+        const typedName = `${objType}.${meth}`;
+        cands.push(...(this.fns.get(typedName) ?? []));
+        // Also try just the method name from the typed class
+        for(const cn of this.classes.keys()) {
+          if(cn === objType || cn.endsWith('::'+objType)) {
+            for(const m of this.getMRO(cn)) {
+              const s = m.includes('::') ? m.split('::')[1] : m;
+              cands.push(...(this.fns.get(`${s}.${meth}`) ?? []));
+            }
+          }
+        }
+      }
+
       const rf=this.res.resolve(cf,obj);if(rf){const b=rf.split('::')[0];cands.push(...(this.fns.get(meth)??[]).filter(r=>r.file===b));}
       for(const cn of this.classes.keys())if(cn===obj||cn.endsWith('::'+obj))for(const m of this.getMRO(cn)){const s=m.includes('::')?m.split('::')[1]:m;cands.push(...(this.fns.get(`${s}.${meth}`)??[]));}
     }
@@ -1786,9 +2955,29 @@ function addCrossFileEdges(uNodes,uEdges,analyzer){
 function buildIFDG(fps,resolver,analyzer){
   const em=new Map();
   const add=(s,d,t)=>{const k=`${s}||${d}||${t}`;if(em.has(k))em.get(k).call_count++;else em.set(k,{src:s,dst:d,dependency_type:t,call_count:1});};
+
+  // Internal file imports
   for(const e of resolver.importEdges())add(e.src,e.dst,'import');
+
+  // Function calls across files
   for(const[cf,cl]of analyzer.calls)for(const{calledName,nArgs}of cl)for(const t of analyzer.resolveCall(cf,calledName,nArgs))if(t.file!==cf)add(cf,t.file,'function_call');
-  return{files:fps.map(f=>({id:f,node_type:'file'})),edges:[...em.values()]};
+
+  // Phase 4: Add external dependency edges
+  for(const e of resolver.externalImportEdges())add(e.src,e.dst,'external_import');
+
+  // Build file nodes
+  const fileNodes = fps.map(f=>({id:f,node_type:'file'}));
+
+  // Phase 4: Add external package nodes
+  const extPkgs = resolver.getExternalPackages();
+  const extNodes = extPkgs.map(p=>({id:`npm:${p}`,node_type:'external_package',package_name:p}));
+
+  return{
+    files: [...fileNodes, ...extNodes],
+    edges: [...em.values()],
+    external_packages: extPkgs,
+    external_package_count: extPkgs.length
+  };
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1953,8 +3142,145 @@ async function main(){
 
   // Call graph
   const cgN=[],cgE=[];
-  for(const[name,recs]of analyzer.fns){if(name.includes('.'))continue;for(const r of recs)cgN.push({id:`${r.file}:${r.nodeId}`,name,qualified_name:r.cls?`${r.cls}.${name}`:name,file:r.file,type:'function',param_count:r.params.length,line:r.line,is_async:r.isAsync,is_gen:r.isGen});}
-  for(const[cf,cl]of analyzer.calls)for(const{calledName,nodeId,nArgs}of cl)for(const t of analyzer.resolveCall(cf,calledName,nArgs))cgE.push({src:`${cf}:${nodeId}`,dst:`${t.file}:${t.nodeId}`,edge_type:'CALL',called_name:calledName,cross_file:t.file!==cf});
+
+  // Add function nodes with method kind information
+  for(const[name,recs]of analyzer.fns){
+    if(name.includes('.'))continue;
+    for(const r of recs) {
+      const qualName = r.cls ? `${r.cls}.${name}` : name;
+      const methodInfo = analyzer.methodKinds.get(qualName);
+      cgN.push({
+        id: `${r.file}:${r.nodeId}`,
+        name,
+        qualified_name: qualName,
+        file: r.file,
+        type: 'function',
+        param_count: r.params.length,
+        line: r.line,
+        is_async: r.isAsync,
+        is_gen: r.isGen,
+        // NEW: Method kind info
+        method_kind: methodInfo?.kind ?? 'function',
+        is_static: methodInfo?.isStatic ?? false,
+        is_getter: methodInfo?.kind === 'get',
+        is_setter: methodInfo?.kind === 'set',
+        is_constructor: methodInfo?.kind === 'constructor' || name === 'constructor'
+      });
+    }
+  }
+
+  // Add call edges with kind differentiation
+  for(const[cf,cl]of analyzer.calls) {
+    for(const call of cl) {
+      const {calledName, nodeId, nArgs, kind} = call;
+      const targets = analyzer.resolveCall(cf, calledName, nArgs);
+      for(const t of targets) {
+        let edgeType = 'CALL';
+        if(kind === 'constructor') edgeType = 'CONSTRUCTOR_CALL';
+        else if(kind === 'super_constructor') edgeType = 'SUPER_CALL';
+        else if(kind === 'promise_handler') continue; // handled separately
+        else if(kind === 'event_handler') continue; // handled separately
+
+        cgE.push({
+          src: `${cf}:${nodeId}`,
+          dst: `${t.file}:${t.nodeId}`,
+          edge_type: edgeType,
+          called_name: calledName,
+          cross_file: t.file !== cf,
+          call_kind: kind ?? 'regular'
+        });
+      }
+    }
+  }
+
+  // Add constructor call nodes
+  for(const ctor of analyzer.constructorCalls) {
+    cgN.push({
+      id: `${ctor.file}:${ctor.line}:ctor`,
+      name: `new ${ctor.className}`,
+      qualified_name: `new ${ctor.className}`,
+      file: ctor.file,
+      type: 'constructor_call',
+      class_name: ctor.className,
+      arg_count: ctor.nArgs,
+      line: ctor.line
+    });
+  }
+
+  // Add super call edges
+  for(const sup of analyzer.superCalls) {
+    if(sup.kind === 'super_method' && sup.method) {
+      // Find the super class method and create edge
+      const parentClass = analyzer.classes.get(sup.cls)?.bases?.[0];
+      if(parentClass) {
+        const methodName = `${parentClass}.${sup.method}`;
+        const targets = analyzer.fns.get(methodName) ?? [];
+        for(const t of targets) {
+          cgE.push({
+            src: `${sup.file}:${sup.line}`,
+            dst: `${t.file}:${t.nodeId}`,
+            edge_type: 'SUPER_METHOD_CALL',
+            called_name: sup.method,
+            parent_class: parentClass,
+            cross_file: t.file !== sup.file
+          });
+        }
+      }
+    }
+  }
+
+  // Phase 5: Add promise chain and event handler edges to call graph
+  let promiseEdgeCount = 0, eventEdgeCount = 0;
+  for(const[cf,cl]of analyzer.calls){
+    for(const call of cl){
+      // Promise handlers (.then, .catch, .finally)
+      if(call.kind === 'promise_handler' && call.calledName) {
+        const targets = analyzer.resolveCall(cf, call.calledName, 0);
+        for(const t of targets){
+          cgE.push({
+            src: `${cf}:${call.nodeId}`,
+            dst: `${t.file}:${t.nodeId}`,
+            edge_type: 'PROMISE_CALLBACK',
+            method: call.method,
+            called_name: call.calledName,
+            cross_file: t.file !== cf
+          });
+          promiseEdgeCount++;
+        }
+      }
+      // Event handlers (.on, .addEventListener, etc.)
+      if(call.kind === 'event_handler' && call.calledName) {
+        const targets = analyzer.resolveCall(cf, call.calledName, 0);
+        for(const t of targets){
+          cgE.push({
+            src: `${cf}:${call.nodeId}`,
+            dst: `${t.file}:${t.nodeId}`,
+            edge_type: 'EVENT_HANDLER',
+            event: call.event,
+            object: call.object,
+            called_name: call.calledName,
+            cross_file: t.file !== cf
+          });
+          eventEdgeCount++;
+        }
+      }
+    }
+  }
+
+  // Phase 2: Add external call nodes to call graph (for tracking coverage)
+  const externalCallNodes = [];
+  for(const ext of analyzer.externalCalls){
+    externalCallNodes.push({
+      id: `${ext.file}:${ext.line}:ext`,
+      name: ext.callee,
+      qualified_name: ext.callee,
+      file: ext.file,
+      type: 'external_call',
+      kind: ext.kind,  // 'builtin' or 'external'
+      module: ext.module,
+      line: ext.line
+    });
+  }
 
   // IFDG
   const ifdg=buildIFDG(fps,resolver,analyzer);
@@ -1976,7 +3302,7 @@ async function main(){
   // Summary — lean, no giant embedded arrays (fix #21)
   emit({
     type:'summary',
-    call_graph:{nodes:cgN,edges:cgE},
+    call_graph:{nodes:[...cgN, ...externalCallNodes],edges:cgE},
     ifdg,
     icfg_count:icfgCount, xddg_count:xDDGCount,
     typed_variables:tp.total()+tsm.count,
@@ -1984,6 +3310,18 @@ async function main(){
     total_functions:[...new Set([...analyzer.fns.keys()].filter(k=>!k.includes('.')))].length,
     total_classes:analyzer.classes.size,
     total_call_sites:[...analyzer.calls.values()].reduce((a,v)=>a+v.length,0),
+    // Phase 5: New metrics
+    promise_callback_edges: promiseEdgeCount,
+    event_handler_edges: eventEdgeCount,
+    // Phase 2: External call tracking
+    external_call_count: analyzer.externalCalls.length,
+    external_builtin_calls: analyzer.externalCalls.filter(e => e.kind === 'builtin').length,
+    external_package_calls: analyzer.externalCalls.filter(e => e.kind === 'external').length,
+    // Phase 4: External package tracking
+    external_packages: ifdg.external_packages ?? [],
+    external_package_count: ifdg.external_package_count ?? 0,
+    // Phase 1: Callback reference count
+    callback_refs: analyzer.callbackRefs.length,
     workspace_aliases:Object.fromEntries(wsA),
     tsconfig_aliases:Object.fromEntries(tscA),
     failed:disc.failed.map(norm),

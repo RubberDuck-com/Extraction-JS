@@ -269,6 +269,7 @@ def run_bridge(repo_path: Path, timeout=BRIDGE_TIMEOUT) -> Optional[dict]:
             ["node", str(BRIDGE_SCRIPT), str(repo_path)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, env=env, bufsize=1,
+            encoding='utf-8', errors='replace',  # fix encoding issues on Windows
         )
     except Exception as ex:
         print(f"    [!] bridge launch: {ex}")
